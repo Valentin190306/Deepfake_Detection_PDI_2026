@@ -1,0 +1,12 @@
+# PyTorch NO va acá: se instala aparte eligiendo el índice según el hardware
+# (CPU o la versión de CUDA que corresponda). Ver el README, sección 2.1.
+
+# Dependencias del código de inferencia de TruFor
+timm
+yacs
+tqdm
+
+# Imágenes, cálculo y visualización de los mapas de manipulación
+numpy
+pillow
+matplotlib
