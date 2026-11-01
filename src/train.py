@@ -123,7 +123,8 @@ def main():
     ap.add_argument("--drop", type=float, default=0.15)
     ap.add_argument("--attn-drop", type=float, default=0.0)
     ap.add_argument("--drop-path", type=float, default=0.1)
-    ap.add_argument("--no-score", action="store_true", help="no usar el score global de TruFor")
+    ap.add_argument("--no-score", action="store_true",
+                    help="no pasar el score global como token (el prior residual sigue activo)")
     ap.add_argument("--no-residual", action="store_true", help="no partir del baseline de TruFor")
     # optimización
     ap.add_argument("--epochs", type=int, default=150)
@@ -224,7 +225,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps({**cfg, **vars(a), "pos_weight_used": pw}, indent=2))
     log_path = out / "log.csv"
-    if not log_path.exists():
+    if not log_path.exists() or a.fresh:
         log_path.write_text("epoch,lr,train_loss,val_loss,acc,bal_acc,f1,auc,ap,thr,f1_best,secs\n")
 
     start, best, bad = 0, -1.0, 0
