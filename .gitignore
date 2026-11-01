@@ -1,6 +1,15 @@
 .venv/
 data/
 runs/
+cache/
+packed/
 __pycache__/
 *.pt
+*.npz
+*.npy
 .ipynb_checkpoints/
+
+# TruFor: código y pesos de terceros (~270 MB), se bajan con scripts/get_trufor.sh
+third_party/
+pruebas/
+.claude

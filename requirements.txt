@@ -1,0 +1,19 @@
+# PyTorch NO va acá: se instala aparte eligiendo el índice según el hardware
+# (CPU o la versión de CUDA que corresponda). Ver el README, sección 2.1.
+# En Colab ya viene instalado con CUDA: no lo reinstales.
+
+# Dependencias del código de inferencia de TruFor.
+# timm se fija en 0.9.x: TruFor usa timm.models.layers y create_model con la
+# API vieja. Con timm 1.x la carga del modelo puede romperse.
+timm==0.9.16
+yacs
+tqdm
+
+# Imágenes, cálculo y visualización de los mapas de manipulación
+numpy
+pillow
+matplotlib
+
+# Métricas de clasificación (AUC / AP) y descarga del dataset en Colab
+scikit-learn
+kagglehub

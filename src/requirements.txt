@@ -1,9 +1,0 @@
-# PyTorch NO va aqui: se instala aparte segun el hardware (ver README, seccion 2.1).
-# En Colab ya viene instalado con CUDA; no lo reinstales.
-
-numpy
-pillow
-matplotlib      # visualizaciones de detect.py y del notebook
-timm            # lo necesita el codigo de TruFor
-yacs            # lo necesita la config de TruFor
-kagglehub       # solo para descargar IMD2020 en el notebook de Colab
