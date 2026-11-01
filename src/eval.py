@@ -46,7 +46,8 @@ def plots(y, p, thr, out: Path):
     ax[0].imshow(cm, cmap="Blues")
     for i in range(2):
         for j in range(2):
-            ax[0].text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=14)
+            ax[0].text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=14,
+                       color="white" if cm[i, j] > cm.max() / 2 else "black")
     ax[0].set_xticks([0, 1], ["pred 0", "pred 1"])
     ax[0].set_yticks([0, 1], ["real 0", "real 1"])
     ax[0].set_title(f"Matriz de confusión (thr {thr:.2f})")
@@ -88,13 +89,14 @@ def gallery(ds, y, p, thr, out: Path, n: int):
     fig, axes = plt.subplots(len(pick), 4, figsize=(13, 3.1 * len(pick)), squeeze=False)
     for r, i in enumerate(pick):
         arr = np.array(ds.arr[ds.idx[i]])           # (5, S, S) uint8
-        rgb = arr[:3].transpose(1, 2, 0)
-        heat, conf = arr[3], arr[4]
-        overlay = rgb / 255.0 * (0.4 + 0.6 * (heat[..., None] / 255.0))
+        rgb = arr[:3].transpose(1, 2, 0).astype(np.float32) / 255.0
+        heat = arr[3].astype(np.float32) / 255.0
+        conf = arr[4].astype(np.float32) / 255.0
+        overlay = rgb * (0.4 + 0.6 * heat[..., None])
         err = (p[i] >= thr) != y[i]
         panels = [(rgb, "original"), (heat, "mapa TruFor"), (conf, "confianza"), (overlay, "overlay")]
         for c, (im, title) in enumerate(panels):
-            axes[r, c].imshow(im, cmap=None if c in (0, 3) else "inferno", vmin=0, vmax=1 if c else 255)
+            axes[r, c].imshow(im, cmap=None if c in (0, 3) else "inferno", vmin=0, vmax=1)
             axes[r, c].set_title(title, fontsize=9)
             axes[r, c].axis("off")
         axes[r, 0].set_title(f"{ds.rows[i]['file'].split('/')[-1]} | real {y[i]} | p {p[i]:.3f}",
