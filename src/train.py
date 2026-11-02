@@ -55,14 +55,17 @@ def best_threshold(y_true: np.ndarray, p: np.ndarray) -> tuple[float, float]:
 
 
 @torch.no_grad()
-def predict(model, loader, device, limit: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def predict(model, loader, device, limit_batches: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Predice sobre el loader. `limit_batches` es solo para depurar: cortar la
+    validación deja métricas sin sentido (AUC/AP quedan en NaN si cae en una sola
+    clase), así que el loop de entrenamiento la mide siempre completa."""
     model.eval()
     ys, ps = [], []
     for i, (x, y, score) in enumerate(loader):
         logits = model(x.to(device), score.to(device))
         ps.append(torch.sigmoid(logits).float().cpu().numpy())
         ys.append(y.numpy().astype(int))
-        if limit and i + 1 >= limit:
+        if limit_batches and i + 1 >= limit_batches:
             break
     return np.concatenate(ys), np.concatenate(ps)
 
@@ -145,7 +148,9 @@ def main():
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--resplit", action="store_true", help="regenerar el split aunque exista")
     ap.add_argument("--fresh", action="store_true", help="ignorar last.pt y empezar de cero")
-    ap.add_argument("--limit-steps", type=int, default=0, help="cortar cada época a N pasos (smoke test)")
+    ap.add_argument("--limit-steps", type=int, default=0,
+                    help="cortar el ENTRENAMIENTO de cada época a N pasos (smoke test); "
+                         "la validación se mide completa")
     a = ap.parse_args()
 
     random.seed(a.seed)
@@ -270,7 +275,14 @@ def main():
 
         if ema:
             eval_model.load_state_dict(ema.state_dict())
-        y_true, p = predict(eval_model, val_dl, device, a.limit_steps)
+        # La validación se mide SIEMPRE completa: --limit-steps solo acelera el
+        # entrenamiento del smoke test. Truncarla deja AUC/AP en NaN cuando las
+        # primeras imágenes del loader son todas de la misma clase (el manifest
+        # lista las manipuladas antes que las auténticas).
+        y_true, p = predict(eval_model, val_dl, device)
+        if len(np.unique(y_true)) < 2:
+            print("AVISO: la validación quedó con una sola clase: AUC y AP no se pueden "
+                  "calcular. Revisá el split o el manifest.")
         m = metrics(y_true, p)
         thr, f1b = best_threshold(y_true, p)
         val_loss = float(F.binary_cross_entropy(
