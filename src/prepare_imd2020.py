@@ -31,21 +31,36 @@ IMD2020 empareja cada imagen manipulada con su original. Si el original cae en
 train y la manipulada en validación, la métrica es mentira. Por eso el split se
 hace por `group`, no por archivo:
 
-  1. Si el dataset conserva una carpeta por escena, el grupo es esa carpeta.
-  2. Si no, el grupo sale de `group_key()` (el nombre sin sufijos ni índice).
-  3. `--link-authentic` recupera el par original/manipulada cuando el release
-     renombró una de las dos carpetas y los ids ya no coinciden. Una imagen y su
-     versión manipulada comparten dimensiones y un dHash casi idéntico, así que
-     se enlazan por (tamaño, dHash <= umbral) exigiendo además que sea el mejor
-     match MUTUO: así no se encadenan escenas distintas.
-  4. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
-     codifican la escena: fusiona grupos con imágenes casi idénticas. En `auto`
-     sólo se activa si ni el nombre ni el enlace lograron agrupar nada; si ya
-     agruparon, el hash sobre-fusiona (un grupo de 24 archivos es la señal).
+  1. `--group-by content` (default en layout plano) compara las IMÁGENES, no los
+     nombres: dos archivos son la misma escena si sus miniaturas correlacionan
+     por encima de --ncc-threshold. Es la única opción fiable cuando el release
+     renumeró los archivos, y el repack de Kaggle lo hizo: sólo 38 de 414
+     auténticas comparten id con una manipulada y de esas 38 la mayoría ni
+     siquiera son la misma foto (NCC mediana 0.71, 29% por debajo de 0.5).
+  2. `--group-by name` usa el nombre: si el dataset conserva una carpeta por
+     escena el grupo es esa carpeta; si no, `group_key()` saca el tipo de
+     versión (_orig, _fake, ...) y el índice de variante (_01, _02, ...).
+  3. En modo `name`, `--link-authentic` (tamaño + dHash mutuo) y
+     `--dedupe-hash` (fusión de grupos casi idénticos) son la red de seguridad.
+
+Cómo se compara el contenido
+----------------------------
+  * dHash de 64 bits como FILTRO de candidatos: barato y tolera la recompresión.
+  * correlación normalizada (NCC) a --work-size en gris como CONFIRMACIÓN,
+    calculada IGNORANDO la zona editada (la máscara del manipulada, dilatada).
+    Comparar la imagen entera castiga los pares con ediciones grandes: pares
+    original/manipulada con NCC global 0.80-0.85 dan 0.995 fuera de la máscara.
+    Con la zona editada ignorada, la misma foto da ~0.99 y dos fotos distintas
+    0.02 (control sobre IMD2020: p99.9 = 0.79, 0.06% por encima de 0.90).
+  * complete-linkage: dos grupos se unen sólo si TODOS sus pares superan el
+    umbral. Single-linkage encadena (A~B y B~C arrastran C aunque A y C no se
+    parezcan) y termina fusionando escenas distintas.
+  * sólo se comparan píxeles de imágenes del mismo tamaño: alinear resoluciones
+    distintas exige reescalar y eso inventa parecidos.
 
 El script es conservador: diagnostica e informa (pares sin máscara, tamaños que
-no coinciden, máscaras posiblemente invertidas, enlaces y grupos fusionados) en
-vez de adivinar en silencio.
+no coinciden, máscaras posiblemente invertidas, grupos y auténticas sin pareja)
+en vez de adivinar en silencio.
 """
 import argparse
 import csv
@@ -53,11 +68,12 @@ import re
 import shutil
 import statistics
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
@@ -248,19 +264,201 @@ def merge_by_hash(paths: list[Path], groups: list[str], threshold: int, verbose=
     return merged
 
 
+def work_gray(path: Path, size: int) -> np.ndarray:
+    """Gris a resolución de trabajo: chico para caber en RAM, grande para ver el detalle."""
+    with Image.open(path) as im:
+        im.draft("L", (size * 2, size * 2))     # JPEG: decodifica a 1/8
+        return np.asarray(im.convert("L").resize((size, size), Image.BILINEAR), dtype=np.uint8)
+
+
+def work_mask(path: Path | None, size: int, dilate: int = 9) -> np.ndarray:
+    """Máscara booleana a resolución de trabajo, dilatada (vacía si no hay máscara).
+
+    Se dilata porque la comparación es a baja resolución: sin dilatación un borde
+    de la edición quedaría fuera de la zona ignorada y ensuciaría la correlación.
+    """
+    if path is None:
+        return np.zeros((size, size), dtype=bool)
+    with Image.open(path) as m:
+        a = m.convert("L").resize((size, size), Image.NEAREST)
+        if dilate > 1:
+            a = a.filter(ImageFilter.MaxFilter(dilate))
+    return np.asarray(a) > 127
+
+
+def masked_ncc(G: np.ndarray, M: np.ndarray, i: int, j: int,
+               min_keep: float = 0.25) -> float:
+    """NCC de dos imágenes ignorando la zona editada de CUALQUIERA de las dos.
+
+    Comparar la imagen entera castiga a los pares con ediciones grandes: medido
+    sobre IMD2020, pares original/manipulada con NCC global 0.80-0.85 tienen NCC
+    fuera de la máscara 0.995. Ignorar lo editado separa de verdad "misma foto"
+    (mediana 0.99) de "foto distinta" (media 0.02).
+    """
+    keep = ~(M[i] | M[j])
+    if keep.mean() < min_keep:
+        return float("nan")                     # casi todo editado: no se puede decidir
+    a = G[i][keep].astype(np.float32)
+    b = G[j][keep].astype(np.float32)
+    a -= a.mean()
+    b -= b.mean()
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na < 1e-6 or nb < 1e-6:
+        return float("nan")                     # región uniforme: NCC indefinida
+    return float((a * b).sum() / (na * nb))
+
+
+def candidate_pairs(hashes: np.ndarray, threshold: int, chunk: int = 512):
+    """Pares (i, j) con i < j y distancia de Hamming <= threshold.
+
+    Se procesa por bloques de filas para no materializar la matriz n x n: con
+    10 000 imágenes serían 100 M de enteros.
+    """
+    bits = _bits(hashes)
+    oi, oj = [], []
+    for s in range(0, len(bits), chunk):
+        d = _hamming(bits[s:s + chunk], bits)
+        ii, jj = np.where(d <= threshold)
+        ii = ii + s
+        keep = jj > ii
+        oi.append(ii[keep])
+        oj.append(jj[keep])
+    if not oi:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    return np.concatenate(oi), np.concatenate(oj)
+
+
+def cluster_complete(n: int, edges: dict[tuple[int, int], float], threshold: float) -> list[int]:
+    """Complete-linkage: une dos grupos sólo si TODOS sus pares superan el umbral.
+
+    Single-linkage encadena (A~B, B~C arrastra C aunque A y C no se parezcan) y
+    termina armando un grupo con fotos distintas. Acá se aceptan primero las
+    aristas más fuertes, así los grupos crecen de adentro hacia afuera.
+    """
+    par = list(range(n))
+    members = {i: [i] for i in range(n)}
+
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+
+    for (i, j), w in sorted(edges.items(), key=lambda kv: -kv[1]):
+        if w < threshold:
+            break
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        ok = True
+        for x in members[ri]:
+            for y in members[rj]:
+                if x != y and edges.get((min(x, y), max(x, y)), 0.0) < threshold:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            par[rj] = ri
+            members[ri].extend(members.pop(rj))
+    return [find(i) for i in range(n)]
+
+
+def group_by_content(paths: list[Path], masks: list[Path | None], sizes: list[tuple[int, int]],
+                     ncc_threshold: float = 0.90, dhash_threshold: int = 16,
+                     work_size: int = 128, verbose: bool = True) -> tuple[list[str], dict]:
+    """Agrupa imágenes que son la MISMA foto, sin mirar el nombre del archivo.
+
+    dHash filtra candidatos (barato, invariante a la recompresión) y la
+    correlación fuera de la máscara confirma (caro pero selectivo). Sólo se
+    comparan píxeles de imágenes del mismo tamaño: alinear resoluciones distintas
+    exige reescalar y eso inventa parecidos.
+
+    Devuelve una etiqueta de grupo por imagen y un dict con las estadísticas.
+    """
+    t0 = time.monotonic()
+    hashes = np.array([dhash(p) for p in paths], dtype=np.uint64)
+    ii, jj = candidate_pairs(hashes, dhash_threshold)
+    wh = np.array([w * 100003 + h for w, h in sizes])
+    same = wh[ii] == wh[jj]
+    ii, jj = ii[same], jj[same]
+
+    G = np.stack([work_gray(p, work_size) for p in paths])
+    M = np.stack([work_mask(m, work_size, max(3, (work_size // 14) | 1)) for m in masks])
+    vals = np.array([masked_ncc(G, M, int(a), int(b)) for a, b in zip(ii, jj)])
+    known = ~np.isnan(vals)
+    edges = {(int(a), int(b)): float(v) for a, b, v in zip(ii[known], jj[known], vals[known])}
+    roots = cluster_complete(len(paths), edges, ncc_threshold)
+
+    members = defaultdict(list)
+    for i, r in enumerate(roots):
+        members[r].append(i)
+
+    labels, used = [""] * len(paths), set()
+    for idxs in members.values():
+        rep = min(idxs)                       # representante estable: el primero
+        base = paths[rep].stem.lower()
+        name, k = base, 1
+        while name in used:                   # dos grupos no pueden llamarse igual
+            k += 1
+            name = f"{base}_{k}"
+        used.add(name)
+        for i in idxs:
+            labels[i] = name
+
+    multi = [v for v in members.values() if len(v) > 1]
+    internal = np.array([edges[(min(a, b), max(a, b))]
+                         for v in multi for x, a in enumerate(v) for b in v[x + 1:]])
+    info = {
+        "groups": len(members), "largest": max(len(v) for v in members.values()),
+        "multi": len(multi), "candidates": len(ii), "pairs": len(edges),
+        "undecided": int((~known).sum()),
+    }
+    if verbose:
+        print(f"  {len(paths)} imágenes -> {info['groups']} grupos "
+              f"(mayor: {info['largest']} archivos, con más de uno: {info['multi']})")
+        print(f"  candidatos dHash<={dhash_threshold}: {info['candidates']} pares | "
+              f"comparables: {info['pairs']} | sin zona limpia: {info['undecided']} | "
+              f"confirmados NCC>={ncc_threshold:.2f}: "
+              f"{sum(1 for w in edges.values() if w >= ncc_threshold)}")
+        if internal.size:
+            print(f"  pares dentro de un grupo: {internal.size} | "
+                  f"NCC mediana {np.median(internal):.3f} | "
+                  f">=0.99: {(internal >= 0.99).mean():.1%} | mínimo {internal.min():.3f}")
+        if info["largest"] > 30:
+            print("  AVISO: un grupo muy grande sugiere umbral bajo; subí --ncc-threshold.")
+        print(f"  ({time.monotonic() - t0:.1f}s)")
+    return labels, info
+
+
 def main():
     ap = argparse.ArgumentParser(description="Prepara IMD2020 para el clasificador")
     ap.add_argument("--src", required=True, help="carpeta del dataset descargado")
     ap.add_argument("--out", default="data")
     ap.add_argument("--prefix", default="imd_")
     ap.add_argument("--invert", action="store_true", help="si las máscaras vienen con 255 = auténtico")
+    ap.add_argument("--group-by", choices=["auto", "name", "content"], default="auto",
+                    help="cómo definir la escena: 'content' compara las imágenes (fiable aunque "
+                         "los nombres sean identificadores sin sentido), 'name' usa el nombre del "
+                         "archivo, 'auto' = content en layout plano y name si hay carpeta por escena")
+    ap.add_argument("--ncc-threshold", type=float, default=0.90,
+                    help="correlación mínima fuera de la zona editada para considerar dos "
+                         "imágenes la misma foto (0-1; 0.90 deja ~0.06%% de falsos positivos)")
+    ap.add_argument("--dhash-candidates", type=int, default=16,
+                    help="distancia Hamming máxima para que un par sea candidato (0-64)")
+    ap.add_argument("--work-size", type=int, default=128,
+                    help="resolución de trabajo para correlacionar (más alto = más preciso "
+                         "y más lento)")
     ap.add_argument("--link-authentic", choices=["on", "off"], default="on",
-                    help="enlazar cada auténtica con su original manipulado (tamaño + dHash)")
+                    help="sólo con --group-by name: enlazar cada auténtica con su original "
+                         "manipulado (tamaño + dHash)")
     ap.add_argument("--link-threshold", type=int, default=8,
-                    help="distancia Hamming máxima para enlazar (0-64)")
+                    help="sólo con --group-by name: distancia Hamming máxima para enlazar (0-64)")
     ap.add_argument("--dedupe-hash", choices=["auto", "on", "off"], default="auto",
-                    help="fusionar grupos con imágenes casi idénticas (auto: solo si nada agrupó)")
-    ap.add_argument("--dedupe-threshold", type=int, default=8, help="distancia Hamming máxima (0-64)")
+                    help="sólo con --group-by name: fusionar grupos con imágenes casi idénticas "
+                         "(auto: solo si nada agrupó)")
+    ap.add_argument("--dedupe-threshold", type=int, default=8,
+                    help="sólo con --group-by name: distancia Hamming máxima (0-64)")
     ap.add_argument("--no-copy", action="store_true",
                     help="no copiar imágenes; el manifest apunta a los archivos originales")
     ap.add_argument("--dry-run", action="store_true", help="solo diagnosticar, no escribir nada")
@@ -291,7 +489,7 @@ def main():
         sys.exit("Menos de la mitad de las imágenes tiene máscara: el emparejamiento por nombre "
                  "no funciona. Revisá los ejemplos de arriba y ajustá MASK_SUFFIX.")
 
-    # ---- grupo base -------------------------------------------------------
+    # ---- grupo base por nombre -------------------------------------------
     def folder_group(p: Path, base: Path) -> str:
         """Carpeta de escena si existe; si el archivo está suelto, su nombre canónico."""
         rel = str(p.parent.relative_to(base))
@@ -304,7 +502,8 @@ def main():
     else:  # una carpeta por escena (layout oficial de IMD2020)
         groups = {k: folder_group(imgs[k], d_img) for k in common}
         groups.update({f"auth:{k}": folder_group(auths[k], d_auth) for k in auths})
-    print(f"layout {'plano' if flat else 'por carpetas'} | grupos base: {len(set(groups.values()))}")
+    print(f"layout {'plano' if flat else 'por carpetas'} | "
+          f"grupos por nombre: {len(set(groups.values()))}")
 
     all_keys = list(common) + [f"auth:{k}" for k in auths]
     all_paths = [imgs[k] for k in common] + [auths[k] for k in auths]
@@ -318,44 +517,72 @@ def main():
     same_size = sum(dims[k] in tamp_sizes for k in auth_keys)
     print(f"auténticas con alguna manipulada del mismo tamaño: {same_size} de {len(auths)}")
 
-    # ---- enlace auténtica -> escena manipulada ----------------------------
-    # Necesario cuando el release renumeró una de las carpetas: el nombre ya no
-    # vincula el original con su manipulación. Es seguro por construcción, así
-    # que si las auténticas fueran un pool independiente simplemente enlaza 0.
-    auth_list = list(auths)
-    pending = [i for i, k in enumerate(auth_keys) if groups[k] not in tamp_groups]
-    if a.link_authentic == "on" and pending and common:
-        print(f"Enlazando {len(pending)} auténticas sin par por nombre (tamaño + dHash):")
-        tamp_items = [{"path": imgs[k], "size": dims[k], "group": groups[k]} for k in common]
-        auth_items = [{"path": auths[auth_list[i]], "size": dims[f"auth:{auth_list[i]}"],
-                       "group": groups[f"auth:{auth_list[i]}"]} for i in pending]
-        links = link_authentic(auth_items, tamp_items, a.link_threshold)
-        for r, g in links.items():
-            groups[f"auth:{auth_list[pending[r]]}"] = g
+    # ---- agrupamiento -----------------------------------------------------
+    # El nombre sólo es fiable si el dataset conserva una carpeta por escena. En
+    # un layout plano lo más probable es que sea un identificador sin relación
+    # con la escena (es el caso del repack de IMD2020 en Kaggle).
+    content = a.group_by == "content" or (a.group_by == "auto" and flat)
+    if content and len(all_paths) > 1:
+        print("\nAgrupando por CONTENIDO (se ignora el nombre del archivo):")
+        mask_paths = [None if k.startswith("auth:") else masks[k] for k in all_keys]
+        labels, info = group_by_content(all_paths, mask_paths,
+                                        [dims[k] for k in all_keys],
+                                        a.ncc_threshold, a.dhash_candidates, a.work_size)
+        if info["groups"] == len(all_paths) and len(set(groups.values())) < len(groups):
+            print("  el contenido no encontró fotos repetidas: se agrupa por nombre.")
+            content = False
+        else:
+            for k, lab in zip(all_keys, labels):
+                groups[k] = lab
+    elif content:
+        content = False
+
+    if content:
+        print("  enlace por tamaño+dHash y dedupe por hash: innecesarios "
+              "(el contenido ya agrupa las escenas).")
+    else:
+        # ---- enlace auténtica -> escena manipulada ------------------------
+        # Necesario cuando el release renumeró una de las carpetas: el nombre ya
+        # no vincula el original con su manipulación. Es seguro por construcción,
+        # así que si las auténticas fueran un pool independiente simplemente
+        # enlaza 0.
+        auth_list = list(auths)
+        pending = [i for i, k in enumerate(auth_keys) if groups[k] not in tamp_groups]
+        if a.link_authentic == "on" and pending and common:
+            print(f"Enlazando {len(pending)} auténticas sin par por nombre (tamaño + dHash):")
+            tamp_items = [{"path": imgs[k], "size": dims[k], "group": groups[k]} for k in common]
+            auth_items = [{"path": auths[auth_list[i]], "size": dims[f"auth:{auth_list[i]}"],
+                           "group": groups[f"auth:{auth_list[i]}"]} for i in pending]
+            links = link_authentic(auth_items, tamp_items, a.link_threshold)
+            for r, g in links.items():
+                groups[f"auth:{auth_list[pending[r]]}"] = g
+
+        all_groups = [groups[k] for k in all_keys]
+        # `auto`: el hash global es la red de seguridad para cuando ni el nombre
+        # ni el enlace lograron agrupar. Si ya agruparon, fusionar por similitud
+        # sobre-fusiona escenas distintas (aparece un grupo enorme).
+        no_name_grouping = len(set(all_groups)) == len(all_groups)
+        no_auth_links = bool(auths) and matched_name == 0
+        use_hash = a.dedupe_hash == "on" or (
+            a.dedupe_hash == "auto" and (no_name_grouping or no_auth_links))
+        if a.dedupe_hash == "auto":
+            print("dedupe por hash: " + (
+                "activado (ni el nombre ni el enlace agruparon)" if use_hash
+                else "innecesario (el nombre o el enlace ya agrupan las escenas)"))
+        if use_hash and all_paths:
+            print("Fusionando grupos por similitud visual (dHash):")
+            for k, g in zip(all_keys, merge_by_hash(all_paths, all_groups, a.dedupe_threshold)):
+                groups[k] = g
 
     all_groups = [groups[k] for k in all_keys]
     tamp_groups = {groups[k] for k in common}
     matched = sum(groups[k] in tamp_groups for k in auth_keys)
-    extra = f" (+{matched - matched_name} por dHash)" if matched > matched_name else ""
+    how = "contenido" if content else "dHash"
+    extra = f" (+{matched - matched_name} por {how})" if matched > matched_name else ""
     print(f"auténticas con escena compartida con una manipulada: {matched} de {len(auths)}{extra}")
     sizes = Counter(all_groups)
     print(f"tamaño de grupo: mayor {max(sizes.values())}, "
           f"con más de 1 archivo: {sum(1 for v in sizes.values() if v > 1)}")
-
-    # `auto`: el hash global es la red de seguridad para cuando ni el nombre ni
-    # el enlace lograron agrupar. Si ya agruparon, fusionar por similitud
-    # sobre-fusiona escenas distintas (aparece un grupo enorme).
-    no_name_grouping = len(set(all_groups)) == len(all_groups)
-    no_auth_links = bool(auths) and matched == 0
-    use_hash = a.dedupe_hash == "on" or (
-        a.dedupe_hash == "auto" and (no_name_grouping or no_auth_links))
-    if a.dedupe_hash == "auto":
-        print("dedupe por hash: " + (
-            "activado (ni el nombre ni el enlace agruparon)" if use_hash
-            else "innecesario (el nombre o el enlace ya agrupan las escenas)"))
-    if use_hash and all_paths:
-        print("Fusionando grupos por similitud visual (dHash):")
-        all_groups = merge_by_hash(all_paths, all_groups, a.dedupe_threshold)
 
     # ---- copiar y escribir manifest --------------------------------------
     if not a.dry_run:
@@ -430,9 +657,14 @@ def main():
         print("AVISO: hay muchas menos auténticas que manipuladas (desbalance). "
               "train.py lo compensa con pos_weight, pero conviene reportar balanced accuracy y AUC.")
     if auths and matched < len(auths):
-        print(f"AVISO: {len(auths) - matched} auténticas quedaron sin escena compartida con una "
-              "manipulada. Si alguna es el original de una manipulada, puede haber fuga entre "
-              "train y validación: probá --link-threshold más alto o --dedupe-hash on.")
+        if content:
+            print(f"NOTA: {len(auths) - matched} auténticas no comparten grupo con ninguna "
+                  "manipulada: su versión editada no está en el release, o la edición es tan "
+                  "grande que no se reconoce. No hay nada que enlazar.")
+        else:
+            print(f"AVISO: {len(auths) - matched} auténticas quedaron sin escena compartida con "
+                  "una manipulada. Si alguna es el original de una manipulada, puede haber fuga "
+                  "entre train y validación: probá --group-by content.")
 
     if not rows:
         sys.exit("No quedó ninguna imagen válida: revisá los avisos de arriba.")

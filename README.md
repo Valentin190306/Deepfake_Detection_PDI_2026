@@ -129,31 +129,48 @@ Genera `data/images`, `data/masks` y **`data/manifest.csv`** con:
 
 **Sobre los grupos.** IMD2020 empareja cada manipulada con su original. Si el
 original cae en train y su versión editada en validación, la métrica mide
-memorización. El script:
+memorización. Hay dos formas de definir la escena y **no son equivalentes**:
 
-1. usa la carpeta de escena si el dataset la conserva;
-2. si no, deriva la escena del **nombre**: saca el tipo de versión (`_orig`,
-   `_fake`, `_edited`, ...) y el índice de variante (`_01`, `_02`, ...), así
-   `<escena>_orig` y `<escena>_fake_01` caen en el mismo grupo;
-3. `--link-authentic` (activo por defecto) recupera el par original/manipulada
-   cuando el release **renumeró** una de las dos carpetas y los ids ya no
-   coinciden. Se apoya en dos invariantes: una imagen y su versión manipulada
-   tienen las **mismas dimensiones** y un **dHash casi idéntico**. Se exige
-   además que sea el **mejor match mutuo**, así no se encadenan escenas
-   distintas. Es seguro por construcción: si las auténticas fueran un pool
-   independiente, enlaza 0 y no cambia nada;
-4. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
-   codifican la escena: fusiona grupos con imágenes casi idénticas. En `auto`
-   sólo se activa si ni el nombre ni el enlace agruparon nada; si ya agruparon,
-   el hash sobre-fusiona (un grupo de 24 archivos es la señal).
+| `--group-by` | cuándo se usa | qué hace |
+|---|---|---|
+| `content` | default en layout plano | compara las **imágenes**, ignora el nombre |
+| `name` | default si hay carpeta por escena | usa la carpeta o el nombre del archivo |
+| `auto` | default | `content` en layout plano, `name` si hay carpeta por escena |
+
+**Por qué el default es `content`.** En el repack de Kaggle, `img/` y
+`Authentic/` usan el mismo esquema `<id>_orig` / `<id>_0`, pero sólo **38 de 414**
+auténticas comparten id con una manipulada… y de esas 38, la mayoría ni siquiera
+son la misma foto (correlación mediana 0.71, 29% por debajo de 0.5). Agrupar por
+nombre ahí es agrupar al azar: medido sobre el dataset real, deja **186 de las
+487 imágenes de validación (38%) con una foto gemela en train**.
+
+Cómo funciona `content`:
+
+1. **dHash** como filtro de candidatos (`--dhash-candidates`, default 16): barato
+   y tolera la recompresión.
+2. **Correlación normalizada (NCC)** como confirmación, calculada **ignorando la
+   zona editada** (la máscara del manipulada, dilatada). Comparar la imagen
+   entera castiga los pares con ediciones grandes: pares original/manipulada con
+   NCC global 0.80–0.85 dan **0.995** fuera de la máscara. Con la zona editada
+   ignorada, la misma foto da ~0.99 y dos fotos distintas 0.02 (control sobre
+   IMD2020: p99.9 = 0.79, **0.06%** por encima de 0.90).
+3. **complete-linkage**: dos grupos se unen sólo si **todos** sus pares superan
+   `--ncc-threshold` (default 0.90). Single-linkage encadena y termina fusionando
+   escenas distintas.
+4. Sólo se comparan píxeles de imágenes del **mismo tamaño**: alinear
+   resoluciones distintas exige reescalar y eso inventa parecidos.
+
+En el dataset real eso da **1606 grupos** (contra 2131 por nombre), con **0
+familias partidas** entre train y validación. Cuesta ~35 s y ~80 MB de RAM.
+
+`--link-authentic` (tamaño + dHash mutuo) y `--dedupe-hash` siguen existiendo
+pero **sólo aplican con `--group-by name`**: con `content` son innecesarios.
 
 El emparejamiento imagen–máscara usa una clave distinta (`pair_key`, sólo saca
 `_mask`), para que dos variantes de la misma escena no se pisen; esa misma clave
 es el nombre de archivo en la salida (`imd_<pair_key>.jpg`,
-`imd_<pair_key>__auth.jpg`), así cambiar la política de agrupamiento no recopia
-nada. El script informa cuántas auténticas quedaron enlazadas por nombre y
-cuántas por dHash; si quedan muchas sueltas, conviene revisar los nombres,
-subir `--link-threshold` o forzar `--dedupe-hash on`.
+`imd_<pair_key>__auth.jpg`), así cambiar la política de agrupamiento **no
+recopia nada**.
 
 Diagnostica además pares sin máscara, tamaños que no coinciden y máscaras
 posiblemente invertidas (`--invert`).
@@ -294,14 +311,22 @@ desde `last.pt`.
 1. **TruFor se entrenó con IMD2020.** Las métricas sobre ese dataset están
    infladas: el modelo ya vio esas imágenes. El número honesto es el de un test
    externo (CASIA, Columbia, CoMoFoD, fotos propias).
-2. **Fuga original/manipulada.** Resuelta con el split por grupo, el enlace
-   auténtica↔manipulada por tamaño + dHash y el dedupe por hash; si agregás
-   datos, regenerá el split (`--resplit`).
-3. **Desbalance 5:1.** Reportar balanced accuracy, F1, AUC y AP.
-4. **ViT desde cero con ~2400 imágenes** es el punto más débil del diseño. El
+2. **Fuga original/manipulada.** Resuelta con el split por grupo y el
+   agrupamiento por contenido (NCC fuera de la máscara); si agregás datos,
+   regenerá el split (`--resplit`). Queda un resto inevitable: **148 de las 414
+   auténticas** del repack de Kaggle no tienen ninguna manipulada relacionada,
+   así que no hay nada que agrupar. Tampoco hay metadatos EXIF (el repack los
+   borró), que habrían dado el emparejamiento exacto.
+3. **El repack de Kaggle está desordenado.** Nombres tipo identificador sin
+   relación con la escena, 45 pares de archivos duplicados literalmente y hasta
+   17 versiones de una misma foto bajo ids distintos. Si aparece un release
+   mejor, `prepare_imd2020.py` lo acepta igual: el agrupamiento por contenido no
+   depende de los nombres.
+4. **Desbalance 5:1.** Reportar balanced accuracy, F1, AUC y AP.
+5. **ViT desde cero con ~2400 imágenes** es el punto más débil del diseño. El
    prior + logit residual garantizan no arrancar peor que TruFor. Si no alcanza,
    la palanca es pasar a un backbone preentrenado (`timm`) sin cambiar el resto.
-5. **TruFor es de uso no comercial.** Hay que citar a los autores si se publican
+6. **TruFor es de uso no comercial.** Hay que citar a los autores si se publican
    resultados (Guillaro et al., *TruFor: Leveraging all-round clues for trustworthy
    image forgery detection and localization*, CVPR 2023).
 
