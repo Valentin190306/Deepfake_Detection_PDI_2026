@@ -21,12 +21,14 @@ Uso:
     python src/detect.py mis_imagenes/ --json runs/resultados.json
 
 El preprocesamiento de la entrada (resize, suavizado, brillo, blancos, CLAHE,
-realce) se configura en la lista PREPROC, más abajo.
+realce) se configura en la lista PREPROC, más abajo. Para comparar varias
+configuraciones sobre un directorio, ver run_experiments().
 
 El modelo es TruFor (Guillaro et al., CVPR 2023), GRIP-UNINA. Licencia de uso
 sin fines de lucro: hay que citar a los autores si se publican resultados.
 """
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -198,6 +200,13 @@ def active_steps(pasos):
     return activos
 
 
+def describe_steps(pasos):
+    """Texto legible de los pasos activos, ej.: 'clahe(clip=2.0, grilla=8) -> realce(...)'."""
+    return " -> ".join(
+        f"{nombre}({', '.join(f'{k}={v}' for k, v in params.items())})" for nombre, params in active_steps(pasos)
+    ) or "ninguno"
+
+
 def preprocess(path, pasos=PREPROC):
     """
     Abre la imagen como RGB uint8, le aplica los pasos activos de `pasos`
@@ -222,6 +231,22 @@ def analyze(model, rgb, device):
     heatmap = torch.softmax(pred.squeeze(0), dim=0)[1].cpu().numpy()
     conf_map = torch.sigmoid(conf.squeeze(0))[0].cpu().numpy() if conf is not None else None
     return score, heatmap, conf_map
+
+
+def run_model(model, rgb, device, name=""):
+    """analyze() con reintento en CPU si la imagen no entra en la GPU."""
+    try:
+        return analyze(model, rgb, device)
+    except torch.cuda.OutOfMemoryError:
+        # Imágenes grandes no entran en 8 GB. Reintentamos en CPU (lento pero
+        # exacto) antes que redimensionar, que arruinaría la detección.
+        print(f"  (sin memoria GPU en {name}, reintento en CPU)")
+        torch.cuda.empty_cache()
+        model.to("cpu")
+        try:
+            return analyze(model, rgb, torch.device("cpu"))
+        finally:
+            model.to(device)
 
 
 def save_viz(out_png, original, heatmap, conf_map, score, verdict):
@@ -267,6 +292,69 @@ def collect_images(target):
     return [f for f in hits if f.is_file() and f.suffix.lower() in IMG_EXT]
 
 
+def run_experiments(directorio, configs, out=None, threshold=0.5, device="auto"):
+    """
+    Corre todas las imágenes de `directorio` (recursivo) con cada configuración
+    de `configs` = {nombre: lista de pasos con el mismo formato que PREPROC}.
+    Imprime una tabla de scores (imagen x configuración) y, si se pasa `out`,
+    la guarda en CSV con una fila por imagen y configuración. Devuelve esas filas.
+
+        run_experiments("pruebas/", {
+            "sin_preproc": [],
+            "clahe":       [("clahe", True, {"clip": 2.0, "grilla": 8})],
+            "bilateral+realce": [
+                ("suavizado", True, {"metodo": "bilateral", "d": 5, "sigma_color": 25, "sigma_space": 5}),
+                ("realce",    True, {"sigma": 1.0, "cantidad": 0.5}),
+            ],
+        }, out="runs/experimento.csv")
+    """
+    images = collect_images(directorio)
+    if not images:
+        sys.exit(f"No encontré imágenes en: {directorio}")
+    descripciones = {nombre: describe_steps(pasos) for nombre, pasos in configs.items()}  # valida antes de cargar el modelo
+
+    device = torch.device(
+        ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
+    )
+    model, _ = load_model(device)
+    print(f"{len(images)} imagen(es) x {len(configs)} configuración(es) | dispositivo: {device} | umbral: {threshold}")
+    for nombre, desc in descripciones.items():
+        print(f"  {nombre}: {desc}")
+    print(f"\n{'imagen':<30}" + "".join(f"{nombre[:14]:>15}" for nombre in configs))
+
+    rows = []
+    for path in images:
+        scores = []
+        for nombre, pasos in configs.items():
+            rgb, _ = preprocess(path, pasos)
+            score, heatmap, _ = run_model(model, rgb, device, path.name)
+            scores.append(score)
+            rows.append({
+                "config": nombre,
+                "file": str(path),
+                "score": score,
+                "verdict": "MANIPULADA" if score >= threshold else "AUTENTICA",
+                "area_sospechosa": float((heatmap >= 0.5).mean()),
+                "pasos": descripciones[nombre],
+            })
+        print(f"{path.name[:29]:<30}" + "".join(f"{s:>15.4f}" for s in scores), flush=True)
+
+    # Qué fracción de las imágenes declara MANIPULADA cada configuración
+    print(f"{'% MANIPULADA':<30}" + "".join(
+        f"{100 * np.mean([r['verdict'] == 'MANIPULADA' for r in rows if r['config'] == nombre]):>14.1f}%"
+        for nombre in configs
+    ))
+
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nResultados en {out}")
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description="Detecta manipulación en imágenes con TruFor")
     ap.add_argument("input", help="imagen, carpeta o glob")
@@ -281,31 +369,20 @@ def main():
     images = collect_images(args.input)
     if not images:
         sys.exit(f"No encontré imágenes en: {args.input}")
-    pasos = active_steps(PREPROC)  # valida la config antes de cargar el modelo
+    preproc = describe_steps(PREPROC)  # valida la config antes de cargar el modelo
 
     device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     )
     model, weights = load_model(device)
     print(f"Modelo: TruFor | pesos: {weights.name} | dispositivo: {device}")
-    print("Preprocesamiento: " + (" -> ".join(
-        f"{nombre}({', '.join(f'{k}={v}' for k, v in params.items())})" for nombre, params in pasos
-    ) or "ninguno"))
+    print(f"Preprocesamiento: {preproc}")
     print(f"{len(images)} imagen(es) | umbral: {args.threshold}\n")
 
     results = []
     for path in images:
         rgb, original = preprocess(path)
-        try:
-            score, heatmap, conf_map = analyze(model, rgb, device)
-        except torch.cuda.OutOfMemoryError:
-            # Imágenes grandes no entran en 8 GB. Reintentamos en CPU (lento pero
-            # exacto) antes que redimensionar, que arruinaría la detección.
-            print(f"  (sin memoria GPU en {path.name}, reintento en CPU)")
-            torch.cuda.empty_cache()
-            model.to("cpu")
-            score, heatmap, conf_map = analyze(model, rgb, torch.device("cpu"))
-            model.to(device)
+        score, heatmap, conf_map = run_model(model, rgb, device, path.name)
 
         verdict = "MANIPULADA" if score >= args.threshold else "AUTENTICA"
         print(f"  {score:.4f}  {verdict:<10}  {path}")
