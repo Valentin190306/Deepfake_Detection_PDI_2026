@@ -132,9 +132,18 @@ original cae en train y su versión editada en validación, la métrica mide
 memorización. El script:
 
 1. usa la carpeta de escena si el dataset la conserva;
-2. si el layout es plano (el caso de Kaggle), calcula un **dHash** de cada imagen
-   y fusiona los grupos cuyas imágenes son casi idénticas (`--dedupe-hash auto`).
-   Eso recupera el par original/manipulada aunque los nombres no se parezcan.
+2. si no, deriva la escena del **nombre**: saca el tipo de versión (`_orig`,
+   `_fake`, `_edited`, ...) y el índice de variante (`_01`, `_02`, ...), así
+   `<escena>_orig` y `<escena>_fake_01` caen en el mismo grupo;
+3. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
+   codifican la escena: si ninguna auténtica comparte grupo con una manipulada,
+   calcula un **dHash** por imagen y fusiona los grupos cuyas imágenes son casi
+   idénticas.
+
+El emparejamiento imagen–máscara usa una clave distinta (`pair_key`, sólo saca
+`_mask`), para que dos variantes de la misma escena no se pisen. El script
+informa cuántas auténticas quedaron emparejadas con una manipulada; si ese
+número es bajo, conviene revisar los nombres o forzar `--dedupe-hash on`.
 
 Diagnostica además pares sin máscara, tamaños que no coinciden y máscaras
 posiblemente invertidas (`--invert`).
