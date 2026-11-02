@@ -78,11 +78,17 @@ def load_model(device):
 
 def preprocess(path):
     """
-    OJO: sin resize. TruFor acepta cualquier tamaño y redimensionar destruiría
+    sin resize. TruFor acepta cualquier tamaño y redimensionar destruiría
     justamente las huellas de bajo nivel (ruido, artefactos) que busca.
     Solo RGB uint8 -> float en [0, 1).
+    
     """
-    arr = np.array(Image.open(path).convert("RGB"))
+
+    img = Image.open(path).convert("RGB")
+    img_res = img.resize((600, 800), Image.Resampling.LANCZOS)
+
+    arr = np.array(img_res)
+    
     t = torch.tensor(arr.transpose(2, 0, 1), dtype=torch.float) / 256.0
     return t.unsqueeze(0), arr  # (1,3,H,W) para la red, y el array original para visualizar
 
