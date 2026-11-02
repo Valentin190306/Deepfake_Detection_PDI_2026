@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import detect
@@ -25,10 +26,6 @@ import detect
 # Cada valor de estos conjuntos representa una variante de un filtro.
 # El generador considera también la opción de no aplicar cada filtro.
 FILTERS = [
-    ("resize", [
-        {"size": (600, 800)},
-        {"size": (800, 600)},
-    ]),
     ("suavizado", [
         {"metodo": "gaussiano", "sigma": 0.5},
         {"metodo": "gaussiano", "sigma": 1.0},
@@ -80,6 +77,24 @@ def collect_labeled_images(root):
     if len({label for _, label in samples}) < 2:
         raise SystemExit("Se necesitan imágenes en originales/ y modificadas/.")
     return sorted(samples, key=lambda sample: str(sample[0]))
+
+
+def fit_size(path, max_size):
+    """Devuelve (ancho, alto) para que la imagen entre en max_size x max_size
+    manteniendo la relación de aspecto, o None si ya entra (o max_size es 0)."""
+    with Image.open(path) as img:
+        width, height = img.size
+    if not max_size or max(width, height) <= max_size:
+        return None
+    scale = max_size / max(width, height)
+    return (max(1, round(width * scale)), max(1, round(height * scale)))
+
+
+def with_size_limit(steps, size):
+    """Antepone un resize que respeta la relación de aspecto si hace falta."""
+    if size is None:
+        return steps
+    return [("resize", True, {"size": size}), *steps]
 
 
 def generate_configs(max_steps):
@@ -142,10 +157,11 @@ def best_threshold(labels, scores):
     )
 
 
-def run(root, output_dir, max_steps, device_arg):
+def run(root, output_dir, max_steps, device_arg, max_size):
     samples = collect_labeled_images(root)
     configs = generate_configs(max_steps)
     labels = [label for _, label in samples]
+    fit_sizes = {path: fit_size(path, max_size) for path, _ in samples}
     device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu") if device_arg == "auto" else device_arg
     )
@@ -156,6 +172,9 @@ def run(root, output_dir, max_steps, device_arg):
         f"{len(labels) - sum(labels)} originales) x {len(configs)} configuraciones"
     )
     print(f"Modelo: {weights.name} | dispositivo: {device} | máximo de filtros: {max_steps}")
+    reduced = sum(size is not None for size in fit_sizes.values())
+    if reduced:
+        print(f"{reduced} imágenes superan {max_size}x{max_size} px y se reducen manteniendo la relación de aspecto.")
     print("La métrica principal es balanced_accuracy; se informa también el resultado con umbral 0.5.\n")
 
     summary_rows = []
@@ -164,7 +183,7 @@ def run(root, output_dir, max_steps, device_arg):
         scores = []
         print(f"[{config_number}/{len(configs)}] {description}", flush=True)
         for path, label in samples:
-            rgb, _ = detect.preprocess(path, pasos=steps)
+            rgb, _ = detect.preprocess(path, pasos=with_size_limit(steps, fit_sizes[path]))
             score, _heatmap, _conf_map = detect.run_model(model, rgb, device, path.name)
             scores.append(score)
             detail_rows.append({
@@ -230,8 +249,11 @@ def main():
     parser.add_argument("--max-steps", type=int, choices=range(0, len(FILTERS) + 1), default=2,
                         help="máximo de filtros combinados por configuración (default: 2)")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--max-size", type=int, default=1000,
+                        help="lado máximo en px; las imágenes más grandes se reducen manteniendo "
+                             "la relación de aspecto (0 = no reducir, default: 1000)")
     args = parser.parse_args()
-    run(args.root, args.out, args.max_steps, args.device)
+    run(args.root, args.out, args.max_steps, args.device, args.max_size)
 
 
 if __name__ == "__main__":
