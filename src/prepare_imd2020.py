@@ -2,10 +2,10 @@
 
 Salida
 ------
-    <out>/images/<prefijo><stem><ext>          manipuladas (bytes originales)
-    <out>/images/<prefijo><stem>__auth<ext>    auténticas
-    <out>/masks/<prefijo><stem>.png            máscara binaria (255 = manipulado)
-    <out>/manifest.csv                         file, mask, label, group, source, width, height
+    <out>/images/<prefijo><pair_key><ext>          manipuladas (bytes originales)
+    <out>/images/<prefijo><pair_key>__auth<ext>    auténticas
+    <out>/masks/<prefijo><pair_key>.png            máscara binaria (255 = manipulado)
+    <out>/manifest.csv                             file, mask, label, group, source, width, height
 
 Layout esperado (se busca en cualquier nivel de --src):
     img/ (manipuladas) + mask/ (máscaras) + Authentic/ (auténticas, sin máscara)
@@ -18,6 +18,8 @@ rompe cualquiera de los dos:
   pair_key   empareja imagen <-> máscara. Sólo saca sufijos de máscara, así
              cada archivo conserva su identidad:
                  <escena>_fake_01.jpg  <->  <escena>_fake_01_mask.png
+             Es también el nombre de archivo en la salida, para que la política
+             de agrupamiento se pueda cambiar sin recopiar nada.
   group_key  identifica la ESCENA. Saca el tipo de versión (_orig, _fake, ...)
              y el índice de variante (_01, _02, ...):
                  <escena>_orig.jpg, <escena>_fake.jpg, <escena>_fake_01.jpg
@@ -31,14 +33,19 @@ hace por `group`, no por archivo:
 
   1. Si el dataset conserva una carpeta por escena, el grupo es esa carpeta.
   2. Si no, el grupo sale de `group_key()` (el nombre sin sufijos ni índice).
-  3. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
-     codifican la escena: calcula un dHash por imagen y fusiona los grupos con
-     imágenes casi idénticas. En `auto` sólo se activa si el nombre no agrupó
-     nada (grupos == archivos); si el nombre ya agrupa, el hash sobre-fusiona.
+  3. `--link-authentic` recupera el par original/manipulada cuando el release
+     renombró una de las dos carpetas y los ids ya no coinciden. Una imagen y su
+     versión manipulada comparten dimensiones y un dHash casi idéntico, así que
+     se enlazan por (tamaño, dHash <= umbral) exigiendo además que sea el mejor
+     match MUTUO: así no se encadenan escenas distintas.
+  4. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
+     codifican la escena: fusiona grupos con imágenes casi idénticas. En `auto`
+     sólo se activa si ni el nombre ni el enlace lograron agrupar nada; si ya
+     agruparon, el hash sobre-fusiona (un grupo de 24 archivos es la señal).
 
 El script es conservador: diagnostica e informa (pares sin máscara, tamaños que
-no coinciden, máscaras posiblemente invertidas, grupos fusionados) en vez de
-adivinar en silencio.
+no coinciden, máscaras posiblemente invertidas, enlaces y grupos fusionados) en
+vez de adivinar en silencio.
 """
 import argparse
 import csv
@@ -46,7 +53,7 @@ import re
 import shutil
 import statistics
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -112,12 +119,31 @@ def index(paths: list[Path]) -> tuple[dict[str, Path], int]:
     return idx, dup
 
 
+def image_size(path: Path) -> tuple[int, int]:
+    """(ancho, alto) leyendo sólo el header, sin decodificar la imagen."""
+    with Image.open(path) as im:
+        return im.size
+
+
 def dhash(path: Path, size: int = 8) -> int:
     """dHash de 64 bits: robusto a recompresión y a ediciones locales chicas."""
     with Image.open(path) as im:
+        # draft hace que libjpeg decodifique a escala 1/8 en vez de tamaño completo:
+        # para 2400 imágenes grandes es la diferencia entre segundos y minutos.
+        im.draft("L", (size + 1, size))
         a = np.asarray(im.convert("L").resize((size + 1, size), Image.LANCZOS), dtype=np.int16)
     bits = (a[:, 1:] > a[:, :-1]).flatten()
     return int.from_bytes(np.packbits(bits).tobytes(), "big")
+
+
+def _bits(hashes: np.ndarray) -> np.ndarray:
+    """(n,) uint64 -> (n, 64) int16 con los bits de cada hash."""
+    return np.unpackbits(hashes.view(np.uint8).reshape(len(hashes), 8), axis=1).astype(np.int16)
+
+
+def _hamming(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Matriz (len(a), len(b)) de distancias de Hamming entre dos lotes de bits."""
+    return a @ (1 - b).T + (1 - a) @ b.T
 
 
 class UnionFind:
@@ -136,14 +162,65 @@ class UnionFind:
             self.p[rb] = ra
 
 
+def link_authentic(auth: list[dict], tamp: list[dict], threshold: int = 8,
+                   verbose: bool = True) -> dict[int, str]:
+    """Enlaza cada auténtica con el grupo de su original manipulado.
+
+    Se apoya en dos invariantes: una imagen y su versión manipulada tienen las
+    MISMAS dimensiones y un dHash casi idéntico (la edición es local). Se exige
+    además que el par sea el mejor match MUTUO, lo que evita cadenas del tipo
+    A~T1, T1~T2, ... que terminan fusionando escenas distintas.
+
+    `auth` y `tamp` son listas de dicts con claves path, size y group.
+    Devuelve {índice dentro de `auth`: grupo de la manipulada enlazada}.
+    """
+    tamp_by_size = defaultdict(list)
+    for j, t in enumerate(tamp):
+        tamp_by_size[t["size"]].append(j)
+    auth_by_size = defaultdict(list)
+    for i, a in enumerate(auth):
+        auth_by_size[a["size"]].append(i)
+
+    cache = {}
+
+    def h(p):
+        if p not in cache:
+            cache[p] = dhash(p)
+        return cache[p]
+
+    links, dists = {}, []
+    for size, tids in tamp_by_size.items():
+        aids = auth_by_size.get(size)
+        if not aids:
+            continue
+        ha = np.array([h(auth[i]["path"]) for i in aids], dtype=np.uint64)
+        ht = np.array([h(tamp[j]["path"]) for j in tids], dtype=np.uint64)
+        d = _hamming(_bits(ha), _bits(ht))
+        best_t = d.argmin(1)                 # para cada auténtica, su mejor manipulada
+        best_a = d.argmin(0)                 # para cada manipulada, su mejor auténtica
+        for r, i in enumerate(aids):
+            j = int(best_t[r])
+            if int(best_a[j]) != r or int(d[r, j]) > threshold:
+                continue                     # no es el mejor mutuo: no se enlaza
+            links[i] = tamp[tids[j]]["group"]
+            dists.append(int(d[r, j]))
+
+    if verbose:
+        print(f"  tamaño+dHash: {len(links)} enlaces aceptados (umbral {threshold})")
+        if dists:
+            hist = Counter(x // 4 * 4 for x in dists)
+            print("  distancia de los enlaces: "
+                  + ", ".join(f"{k}-{k + 3}:{v}" for k, v in sorted(hist.items())))
+    return links
+
+
 def merge_by_hash(paths: list[Path], groups: list[str], threshold: int, verbose=True):
     """Fusiona grupos cuyas imágenes son casi idénticas (distancia de Hamming <= threshold)."""
     if verbose:
         print(f"  calculando dHash de {len(paths)} imágenes...")
     hashes = np.array([dhash(p) for p in paths], dtype=np.uint64)
-    bits = np.unpackbits(hashes.view(np.uint8).reshape(len(paths), 8), axis=1).astype(np.int16)
-    # Hamming(a,b) = #bits donde difieren
-    d = bits @ (1 - bits).T + (1 - bits) @ bits.T
+    bits = _bits(hashes)
+    d = _hamming(bits, bits)
     np.fill_diagonal(d, 64)
 
     uf = UnionFind(len(paths))
@@ -177,8 +254,12 @@ def main():
     ap.add_argument("--out", default="data")
     ap.add_argument("--prefix", default="imd_")
     ap.add_argument("--invert", action="store_true", help="si las máscaras vienen con 255 = auténtico")
+    ap.add_argument("--link-authentic", choices=["on", "off"], default="on",
+                    help="enlazar cada auténtica con su original manipulado (tamaño + dHash)")
+    ap.add_argument("--link-threshold", type=int, default=8,
+                    help="distancia Hamming máxima para enlazar (0-64)")
     ap.add_argument("--dedupe-hash", choices=["auto", "on", "off"], default="auto",
-                    help="fusionar grupos con imágenes casi idénticas (auto: solo si el nombre no agrupa)")
+                    help="fusionar grupos con imágenes casi idénticas (auto: solo si nada agrupó)")
     ap.add_argument("--dedupe-threshold", type=int, default=8, help="distancia Hamming máxima (0-64)")
     ap.add_argument("--no-copy", action="store_true",
                     help="no copiar imágenes; el manifest apunta a los archivos originales")
@@ -225,30 +306,53 @@ def main():
         groups.update({f"auth:{k}": folder_group(auths[k], d_auth) for k in auths})
     print(f"layout {'plano' if flat else 'por carpetas'} | grupos base: {len(set(groups.values()))}")
 
-    tamp_groups = {groups[k] for k in common}
-    auth_groups = [groups[f"auth:{k}"] for k in auths]
-    matched = sum(g in tamp_groups for g in auth_groups)
-    print(f"auténticas emparejadas por nombre con una manipulada: {matched} de {len(auths)}")
-    sizes = Counter(groups.values())
-    if sizes:
-        print(f"tamaño de grupo: mayor {max(sizes.values())}, "
-              f"con más de 1 archivo: {sum(1 for v in sizes.values() if v > 1)}")
-
-    all_paths = [imgs[k] for k in common] + [auths[k] for k in auths]
     all_keys = list(common) + [f"auth:{k}" for k in auths]
-    all_groups = [groups[k] for k in all_keys]
+    all_paths = [imgs[k] for k in common] + [auths[k] for k in auths]
+    dims = {k: image_size(p) for k, p in zip(all_keys, all_paths)}
 
-    # `auto`: el hash es la red de seguridad para cuando el nombre no vincula
-    # las auténticas con sus manipuladas. Si el nombre ya las agrupa, fusionar
-    # por similitud sobre-fusiona escenas distintas.
+    tamp_groups = {groups[k] for k in common}
+    auth_keys = [f"auth:{k}" for k in auths]
+    matched_name = sum(groups[k] in tamp_groups for k in auth_keys)
+    print(f"auténticas emparejadas por nombre con una manipulada: {matched_name} de {len(auths)}")
+    tamp_sizes = {dims[k] for k in common}
+    same_size = sum(dims[k] in tamp_sizes for k in auth_keys)
+    print(f"auténticas con alguna manipulada del mismo tamaño: {same_size} de {len(auths)}")
+
+    # ---- enlace auténtica -> escena manipulada ----------------------------
+    # Necesario cuando el release renumeró una de las carpetas: el nombre ya no
+    # vincula el original con su manipulación. Es seguro por construcción, así
+    # que si las auténticas fueran un pool independiente simplemente enlaza 0.
+    auth_list = list(auths)
+    pending = [i for i, k in enumerate(auth_keys) if groups[k] not in tamp_groups]
+    if a.link_authentic == "on" and pending and common:
+        print(f"Enlazando {len(pending)} auténticas sin par por nombre (tamaño + dHash):")
+        tamp_items = [{"path": imgs[k], "size": dims[k], "group": groups[k]} for k in common]
+        auth_items = [{"path": auths[auth_list[i]], "size": dims[f"auth:{auth_list[i]}"],
+                       "group": groups[f"auth:{auth_list[i]}"]} for i in pending]
+        links = link_authentic(auth_items, tamp_items, a.link_threshold)
+        for r, g in links.items():
+            groups[f"auth:{auth_list[pending[r]]}"] = g
+
+    all_groups = [groups[k] for k in all_keys]
+    tamp_groups = {groups[k] for k in common}
+    matched = sum(groups[k] in tamp_groups for k in auth_keys)
+    extra = f" (+{matched - matched_name} por dHash)" if matched > matched_name else ""
+    print(f"auténticas con escena compartida con una manipulada: {matched} de {len(auths)}{extra}")
+    sizes = Counter(all_groups)
+    print(f"tamaño de grupo: mayor {max(sizes.values())}, "
+          f"con más de 1 archivo: {sum(1 for v in sizes.values() if v > 1)}")
+
+    # `auto`: el hash global es la red de seguridad para cuando ni el nombre ni
+    # el enlace lograron agrupar. Si ya agruparon, fusionar por similitud
+    # sobre-fusiona escenas distintas (aparece un grupo enorme).
     no_name_grouping = len(set(all_groups)) == len(all_groups)
     no_auth_links = bool(auths) and matched == 0
     use_hash = a.dedupe_hash == "on" or (
         a.dedupe_hash == "auto" and (no_name_grouping or no_auth_links))
     if a.dedupe_hash == "auto":
         print("dedupe por hash: " + (
-            "activado (el nombre no vincula auténticas con manipuladas)" if use_hash
-            else "innecesario (el nombre ya agrupa las escenas)"))
+            "activado (ni el nombre ni el enlace agruparon)" if use_hash
+            else "innecesario (el nombre o el enlace ya agrupan las escenas)"))
     if use_hash and all_paths:
         print("Fusionando grupos por similitud visual (dHash):")
         all_groups = merge_by_hash(all_paths, all_groups, a.dedupe_threshold)
@@ -274,13 +378,11 @@ def main():
     for idx, k in enumerate(all_keys):
         auth = k.startswith("auth:")
         src = all_paths[idx]
-        with Image.open(src) as im:
-            w, h = im.size
+        w, h = dims[k]
 
-        # Manipuladas: pair key (única por archivo). Auténticas: la escena, así
-        # <escena>_orig.jpg queda como imd_<escena>__auth.jpg.
-        stem = all_groups[idx] if auth else k.removeprefix("auth:")
-        name = dst_name(safe(stem), src.suffix.lower(), auth)
+        # El nombre de archivo sale del pair key (identidad del archivo), no del
+        # grupo: así cambiar la política de agrupamiento no recopia nada.
+        name = dst_name(safe(k.removeprefix("auth:")), src.suffix.lower(), auth)
         if not a.no_copy:
             dst = out / "images" / name
             if not dst.exists() and not a.dry_run:
@@ -327,10 +429,10 @@ def main():
     if n_auth and n_auth / max(n_tamp, 1) < 0.4:
         print("AVISO: hay muchas menos auténticas que manipuladas (desbalance). "
               "train.py lo compensa con pos_weight, pero conviene reportar balanced accuracy y AUC.")
-    if flat and not use_hash and matched < len(auths):
-        print(f"AVISO: {len(auths) - matched} auténticas no comparten grupo con ninguna "
-              "manipulada. Si alguna es el original de una manipulada con otro nombre, hay "
-              "fuga entre train y validación: probá --dedupe-hash on.")
+    if auths and matched < len(auths):
+        print(f"AVISO: {len(auths) - matched} auténticas quedaron sin escena compartida con una "
+              "manipulada. Si alguna es el original de una manipulada, puede haber fuga entre "
+              "train y validación: probá --link-threshold más alto o --dedupe-hash on.")
 
     if not rows:
         sys.exit("No quedó ninguna imagen válida: revisá los avisos de arriba.")

@@ -135,15 +135,25 @@ memorización. El script:
 2. si no, deriva la escena del **nombre**: saca el tipo de versión (`_orig`,
    `_fake`, `_edited`, ...) y el índice de variante (`_01`, `_02`, ...), así
    `<escena>_orig` y `<escena>_fake_01` caen en el mismo grupo;
-3. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
-   codifican la escena: si ninguna auténtica comparte grupo con una manipulada,
-   calcula un **dHash** por imagen y fusiona los grupos cuyas imágenes son casi
-   idénticas.
+3. `--link-authentic` (activo por defecto) recupera el par original/manipulada
+   cuando el release **renumeró** una de las dos carpetas y los ids ya no
+   coinciden. Se apoya en dos invariantes: una imagen y su versión manipulada
+   tienen las **mismas dimensiones** y un **dHash casi idéntico**. Se exige
+   además que sea el **mejor match mutuo**, así no se encadenan escenas
+   distintas. Es seguro por construcción: si las auténticas fueran un pool
+   independiente, enlaza 0 y no cambia nada;
+4. `--dedupe-hash` es la red de seguridad para datasets cuyos nombres no
+   codifican la escena: fusiona grupos con imágenes casi idénticas. En `auto`
+   sólo se activa si ni el nombre ni el enlace agruparon nada; si ya agruparon,
+   el hash sobre-fusiona (un grupo de 24 archivos es la señal).
 
 El emparejamiento imagen–máscara usa una clave distinta (`pair_key`, sólo saca
-`_mask`), para que dos variantes de la misma escena no se pisen. El script
-informa cuántas auténticas quedaron emparejadas con una manipulada; si ese
-número es bajo, conviene revisar los nombres o forzar `--dedupe-hash on`.
+`_mask`), para que dos variantes de la misma escena no se pisen; esa misma clave
+es el nombre de archivo en la salida (`imd_<pair_key>.jpg`,
+`imd_<pair_key>__auth.jpg`), así cambiar la política de agrupamiento no recopia
+nada. El script informa cuántas auténticas quedaron enlazadas por nombre y
+cuántas por dHash; si quedan muchas sueltas, conviene revisar los nombres,
+subir `--link-threshold` o forzar `--dedupe-hash on`.
 
 Diagnostica además pares sin máscara, tamaños que no coinciden y máscaras
 posiblemente invertidas (`--invert`).
@@ -284,8 +294,9 @@ desde `last.pt`.
 1. **TruFor se entrenó con IMD2020.** Las métricas sobre ese dataset están
    infladas: el modelo ya vio esas imágenes. El número honesto es el de un test
    externo (CASIA, Columbia, CoMoFoD, fotos propias).
-2. **Fuga original/manipulada.** Resuelta con el split por grupo y el dedupe por
-   dHash; si agregás datos, regenerá el split (`--resplit`).
+2. **Fuga original/manipulada.** Resuelta con el split por grupo, el enlace
+   auténtica↔manipulada por tamaño + dHash y el dedupe por hash; si agregás
+   datos, regenerá el split (`--resplit`).
 3. **Desbalance 5:1.** Reportar balanced accuracy, F1, AUC y AP.
 4. **ViT desde cero con ~2400 imágenes** es el punto más débil del diseño. El
    prior + logit residual garantizan no arrancar peor que TruFor. Si no alcanza,
