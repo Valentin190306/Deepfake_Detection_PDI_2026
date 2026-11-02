@@ -10,3 +10,6 @@ tqdm
 numpy
 pillow
 matplotlib
+
+# Filtros del preprocesamiento (bilateral, NL-means, CLAHE). Headless: sin GUI
+opencv-python-headless

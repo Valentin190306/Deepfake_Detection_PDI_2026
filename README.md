@@ -132,9 +132,26 @@ python src/detect.py mis_fotos/ --json runs/resultados.json
 python src/detect.py foto.png --device cpu
 ```
 
-Opciones: `--viz` guarda un PNG por imagen con 4 paneles (original, mapa de manipulación, overlay, confianza); `--out` indica dónde; `--json` vuelca scores y `area_sospechosa` (porcentaje del área marcada como editada); `--threshold` es el corte para declarar MANIPULADA (default 0.5).
+Opciones: `--viz` guarda un PNG por imagen con 4 paneles (entrada al modelo, mapa de manipulación, overlay, confianza); `--out` indica dónde; `--json` vuelca scores y `area_sospechosa` (porcentaje del área marcada como editada); `--threshold` es el corte para declarar MANIPULADA (default 0.5).
 
 Imágenes grandes pueden no entrar en la memoria de la GPU. El script detecta el *out of memory* y reintenta esa imagen en CPU automáticamente: es más lento, pero no se cae ni redimensiona (redimensionar arruinaría la detección, ver sección 6).
+
+### 4.1 Preprocesamiento de la entrada
+
+Antes de pasar la imagen al modelo se le puede aplicar una cadena de filtros. Se configura **por código**, en la lista `PREPROC` al principio de [src/detect.py](src/detect.py): cada paso tiene un `True/False` para activarlo y sus parámetros; se aplican en el orden de la lista. Al correr, el script imprime qué pasos usó.
+
+| paso | qué hace | parámetros |
+|---|---|---|
+| `resize` | redimensiona a (ancho, alto), sin respetar la relación de aspecto | `size` |
+| `suavizado` | reducción de ruido: `gaussiano`, `mediana`, `bilateral` o `nlmeans` | `metodo` + los del método (`sigma`, `ksize`, `d`/`sigma_color`/`sigma_space`, `h`) |
+| `brillo` | gamma y después `factor * x + offset` | `factor`, `offset`, `gamma` |
+| `blancos` | comprime las altas luces por encima de un umbral, sin correr el color | `umbral`, `fuerza` (0 a 1) |
+| `clahe` | ecualización adaptativa de histograma sobre la luminancia (contraste local) | `clip`, `grilla` |
+| `realce` | unsharp mask: amplifica las altas frecuencias, donde está el ruido | `sigma`, `cantidad` |
+
+Desde un notebook se puede probar otra configuración sin tocar el archivo: `detect.preprocess(path, pasos=[("clahe", True, {"clip": 3.0, "grilla": 8})])`.
+
+> Todo paso de preprocesamiento modifica justamente las huellas de bajo nivel que mira TruFor (ver sección 6, punto 1). Ninguno es una mejora garantizada: hay que medir cada configuración contra la corrida sin preprocesar, sobre imágenes con ground-truth conocido.
 
 ## 5. Cómo probarlo con casos propios
 
