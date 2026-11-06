@@ -117,7 +117,7 @@ class TruForViTClassifier(nn.Module):
             nn.init.trunc_normal_(m.weight, std=0.02)
             nn.init.zeros_(m.bias)
 
-    def forward(self, x, score=None):
+    def forward(self, x, score=None, return_parts=False):
         B = x.shape[0]
         t = self.patch_embed(x).flatten(2).transpose(1, 2)          # (B, N, dim)
         cls = self.cls_token.expand(B, -1, -1) + self.pos_embed[:, :1]
@@ -131,10 +131,15 @@ class TruForViTClassifier(nn.Module):
 
         t = torch.cat([cls, t + self.pos_embed[:, 1:]], 1)
         t = self.norm(self.blocks(t))
-        logit = self.head(t[:, 0]).squeeze(-1)
+        vit_logit = self.head(t[:, 0]).squeeze(-1)
 
+        logit = vit_logit
         if self.residual and prior is not None:
             logit = logit + self.alpha * prior
+        if return_parts:
+            # `vit_logit` es la rama propia, sin el prior: sirve para la loss
+            # auxiliar, que evita que el modelo se limite a calibrar TruFor.
+            return logit, vit_logit
         return logit
 
 

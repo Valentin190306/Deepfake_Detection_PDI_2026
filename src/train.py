@@ -47,12 +47,24 @@ def metrics(y_true: np.ndarray, p: np.ndarray, thr: float = 0.5) -> dict:
     return out
 
 
-def best_threshold(y_true: np.ndarray, p: np.ndarray) -> tuple[float, float]:
-    from sklearn.metrics import f1_score
-    thrs = np.linspace(0.05, 0.95, 19)
-    f1s = [f1_score(y_true, (p >= t).astype(int), zero_division=0) for t in thrs]
-    i = int(np.argmax(f1s))
-    return float(thrs[i]), float(f1s[i])
+def best_threshold(y_true: np.ndarray, p: np.ndarray, metric: str = "bal_acc") -> tuple[float, float]:
+    """Umbral que maximiza `metric` sobre la validación.
+
+    Por defecto balanced accuracy y no F1: F1 depende de la prevalencia, así que
+    con una validación 77/23 el óptimo se corre hacia predecir positivo y marca
+    como manipulada casi cualquier foto auténtica. Balanced accuracy pesa igual
+    las dos clases, que es lo que se quiere al elegir el punto de operación.
+    """
+    from sklearn.metrics import balanced_accuracy_score, f1_score
+    thrs = np.linspace(0.05, 0.95, 91)
+    if metric == "bal_acc":
+        scores = [balanced_accuracy_score(y_true, (p >= t).astype(int)) for t in thrs]
+    elif metric == "f1":
+        scores = [f1_score(y_true, (p >= t).astype(int), zero_division=0) for t in thrs]
+    else:
+        raise ValueError(f"metric desconocida: {metric}")
+    i = int(np.argmax(scores))
+    return float(thrs[i]), float(scores[i])
 
 
 @torch.no_grad()
@@ -139,6 +151,10 @@ def main():
     ap.add_argument("--min-lr", type=float, default=0.01, help="fracción del lr al final del coseno")
     ap.add_argument("--label-smoothing", type=float, default=0.05)
     ap.add_argument("--pos-weight", default="auto", help="'auto', 'none' o un número")
+    ap.add_argument("--aux-weight", type=float, default=0.5,
+                    help="peso de la loss auxiliar sobre el logit propio del ViT (sin el "
+                         "prior). Evita que la rama colapse a calibrar TruFor; 0 la apaga. "
+                         "Sólo aplica con --residual (default)")
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--ema", type=float, default=0.999, help="0 para desactivar")
@@ -234,7 +250,8 @@ def main():
     else:
         pw = float(a.pos_weight)
     pw_t = torch.tensor(pw, device=device)
-    print(f"pos_weight={pw:.2f}")
+    aux = a.aux_weight if model.residual else 0.0
+    print(f"pos_weight={pw:.2f} | aux_weight={aux:.2f}")
 
     ema = EMA(model, a.ema) if a.ema > 0 else None
     eval_model = copy.deepcopy(model).to(device) if ema else model
@@ -250,6 +267,12 @@ def main():
     last = out / "last.pt"
     if last.exists() and not a.fresh:
         ck = torch.load(last, map_location=device, weights_only=False)
+        old = ck.get("args", {})
+        changed = [k for k in ("aux_weight", "no_score", "no_residual", "channels", "size")
+                   if k in old and old.get(k) != vars(a).get(k)]
+        if changed:
+            print(f"AVISO: reanudás con flags distintos a la corrida guardada: {changed}. "
+                  "Si querés comparar de cero, usá --fresh o un --out nuevo.")
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
@@ -269,7 +292,14 @@ def main():
             x, y, score = x.to(device), y.to(device), score.to(device)
             y_s = y * (1 - a.label_smoothing) + a.label_smoothing / 2
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                loss = F.binary_cross_entropy_with_logits(model(x, score), y_s, pos_weight=pw_t)
+                logit, vit_logit = model(x, score, return_parts=True)
+                loss = F.binary_cross_entropy_with_logits(logit, y_s, pos_weight=pw_t)
+                if a.aux_weight > 0 and model.residual:
+                    # Supervisar también la rama sin el prior: si no, el camino más
+                    # barato es dejarla en cero y limitarse a atenuar el score de
+                    # TruFor (lo que pasó en el primer run).
+                    loss = loss + a.aux_weight * F.binary_cross_entropy_with_logits(
+                        vit_logit, y_s, pos_weight=pw_t)
                 loss = loss / a.grad_accum
             scaler.scale(loss).backward()
             if (i + 1) % a.grad_accum == 0 or i + 1 == len(train_dl):
@@ -297,7 +327,10 @@ def main():
             print("AVISO: la validación quedó con una sola clase: AUC y AP no se pueden "
                   "calcular. Revisá el split o el manifest.")
         m = metrics(y_true, p)
-        thr, f1b = best_threshold(y_true, p)
+        # Dos umbrales: el de operación (balanced accuracy) y el que maximiza F1,
+        # que se guarda sólo para comparar con corridas viejas.
+        thr, balb = best_threshold(y_true, p, "bal_acc")
+        thr_f1, f1b = best_threshold(y_true, p, "f1")
         val_loss = float(F.binary_cross_entropy(
             torch.tensor(p).clamp(1e-6, 1 - 1e-6), torch.tensor(y_true, dtype=torch.float32)).item())
         secs = time.monotonic() - t0
@@ -306,7 +339,8 @@ def main():
         print(f"ep {ep + 1:03d}/{a.epochs} | lr {sched.get_last_lr()[0]:.1e} | "
               f"loss {total / max(n, 1):.3f} | val {val_loss:.3f} | "
               f"acc {m['acc']:.3f} bal {m['bal_acc']:.3f} F1 {m['f1']:.3f} "
-              f"AUC {m['auc']:.3f} AP {m['ap']:.3f} | F1* {f1b:.3f}@{thr:.2f} | {secs:.0f}s")
+              f"AUC {m['auc']:.3f} AP {m['ap']:.3f} | "
+              f"bal* {balb:.3f}@{thr:.2f} F1* {f1b:.3f}@{thr_f1:.2f} | {secs:.0f}s")
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([ep + 1, f"{sched.get_last_lr()[0]:.6g}", f"{total / max(n, 1):.4f}",
                                     f"{val_loss:.4f}", f"{m['acc']:.4f}", f"{m['bal_acc']:.4f}",
@@ -318,7 +352,8 @@ def main():
             best = m["auc"]
             bad = 0
             save_atomic({"model": eval_model.state_dict(), "cfg": cfg, "epoch": ep,
-                         "metrics": m, "thr": thr}, out / "best.pt")
+                         "metrics": m, "thr": thr, "thr_f1": thr_f1,
+                         "bal_best": balb, "f1_best": f1b}, out / "best.pt")
         else:
             bad += 1
         save_atomic({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),

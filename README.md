@@ -300,6 +300,12 @@ python src/train.py --manifest data/manifest.csv --packed packed/raw__s384 \
   `vit_logit + alpha·logit(score)` con `alpha=1`. En la época 0 el modelo equivale
   a TruFor; solo aprende una corrección. `--no-score` / `--no-residual` lo apagan
   para la ablación.
+- **Loss auxiliar** (`--aux-weight`, default 0.5): supervisa también `vit_logit`
+  (la rama sin el prior). Sin ella el residual tiene una salida trivial: dejar la
+  rama en cero y sólo atenuar el score de TruFor. Medido en el primer run, el ViT
+  terminó con **Spearman −0.96** contra el prior y **AUC idéntico al baseline**:
+  aprendió a calibrar, no a detectar. Con `--aux-weight 0` se reproduce ese
+  comportamiento; con `--no-residual` no aplica.
 - **Canales**: `--channels maps+rgb` (5) o `--channels maps` (2, solo los mapas).
 - **Optimización**: AdamW (sin weight decay en normas/biases/tokens), warmup +
   coseno, AMP fp16, grad clipping, EMA opcional, early stopping por AUC.
@@ -331,6 +337,27 @@ python src/eval.py --manifest data/manifest.csv --packed packed/raw__s384 \
 Imprime accuracy, balanced accuracy, F1, AUC y AP; guarda `metrics.json`,
 `predictions.csv`, `metricas.png` (matriz de confusión + ROC + PR) y `galeria.png`
 (errores más confiados primero).
+
+**El umbral importa más que el modelo.** La validación pareada es 77% manipulada
+(200 positivas y 61 auténticas), así que:
+
+- `best_threshold()` elige el umbral por **balanced accuracy**, no por F1. Con F1,
+  la prevalencia corre el óptimo hacia predecir positivo y marca como trucada casi
+  cualquier foto buena (medido: thr 0.15 → 85% de falsos positivos sobre las
+  auténticas). El checkpoint guarda `thr` (balanceado) y `thr_f1` (para comparar).
+- `eval.py` imprime la **matriz de confusión** y el **TPR a FPR fijo** (1%, 5%, 10%),
+  que no dependen del umbral elegido. En uso real, "cuántas trucadas detecto si
+  acepto 5% de falsos positivos" es la pregunta, no un umbral único.
+- `--threshold 0.6` fuerza un umbral; `--thr-f1` usa el de F1 guardado.
+
+`--bootstrap N` agrega un IC 95% de AUC y balanced accuracy remuestreando
+**escenas**, no imágenes: las ~3 variantes de una misma foto no son
+independientes, así que un bootstrap por fila da intervalos demasiado angostos.
+Con 61 escenas en validación el IC es ancho (±0.05 o más) y conviene reportarlo.
+
+```bash
+python src/eval.py ... --bootstrap 500
+```
 
 Para un **test externo** (otro dataset, fotos propias) usá `--split all` con su
 propio manifest y cache:
@@ -380,8 +407,12 @@ desde `last.pt`.
    (776/776), a costa de usar 264 escenas y 1042 imágenes únicas. En los dos casos
    reportar balanced accuracy, F1, AUC y AP.
 5. **ViT desde cero con ~1000–2400 imágenes** es el punto más débil del diseño. El
-   prior + logit residual garantizan no arrancar peor que TruFor. Si no alcanza,
-   la palanca es pasar a un backbone preentrenado (`timm`) sin cambiar el resto.
+   prior + logit residual garantizan no arrancar peor que TruFor, pero también
+   ofrecen una salida trivial: copiar el score. En el primer run el ViT quedó con
+   Spearman −0.96 contra el prior y AUC idéntico al baseline; la loss auxiliar
+   (`--aux-weight`) es el remedio, y la ablación `--no-score --no-residual` dice si
+   los mapas alcanzan por sí solos. Si no alcanzan, la palanca es más datos, SSL o
+   un backbone preentrenado (`timm`).
 6. **TruFor es de uso no comercial.** Hay que citar a los autores si se publican
    resultados (Guillaro et al., *TruFor: Leveraging all-round clues for trustworthy
    image forgery detection and localization*, CVPR 2023).
