@@ -77,6 +77,18 @@ def main():
     if not manifest.exists():
         sys.exit(f"No existe {manifest}. Corré primero src/prepare_imd2020.py")
     rows = read_manifest(manifest)
+    # `--pairs balanced` repite la auténtica una vez por variante manipulada: se
+    # procesa una vez por archivo, si no TruFor corre de más sobre la misma foto.
+    seen, unique = set(), []
+    for r in rows:
+        stem = Path(r["file"]).stem
+        if stem in seen:
+            continue
+        seen.add(stem)
+        unique.append(r)
+    if len(unique) != len(rows):
+        print(f"manifest: {len(rows)} filas -> {len(unique)} imágenes únicas")
+    rows = unique
     if a.limit:
         rows = rows[:a.limit]
     for v in a.variants:

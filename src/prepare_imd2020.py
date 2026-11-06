@@ -43,6 +43,24 @@ hace por `group`, no por archivo:
   3. En modo `name`, `--link-authentic` (tamaño + dHash mutuo) y
      `--dedupe-hash` (fusión de grupos casi idénticos) son la red de seguridad.
 
+Qué imágenes entran (`--pairs`)
+-------------------------------
+El agrupamiento resuelve la fuga, pero no la confusión escena <-> clase: si las
+manipuladas salen de escenas que nunca aparecen como auténticas, el modelo puede
+aprender "esta escena es trucada" en vez de "esta zona está editada".
+
+  off       todas las imágenes (default, compatible con cualquier dataset).
+  unique    sólo escenas con las DOS clases: la única diferencia entre clases es
+            la edición. Una fila por archivo.
+  balanced  igual que `unique`, pero emite una fila auténtica por cada variante
+            manipulada de la escena. Cada escena pesa lo mismo en las dos clases
+            y el conjunto queda 1:1 (pos_weight = 1), a costa de repetir la misma
+            auténtica. En IMD2020: 1606 -> 264 escenas y 2424 -> 1552 filas
+            (1042 imágenes únicas), descartando el 61% de las manipuladas.
+
+Las copias apuntan al MISMO archivo (no se duplican bytes): el cache guarda un
+.npz por imagen única.
+
 Cómo se compara el contenido
 ----------------------------
   * dHash de 64 bits como FILTRO de candidatos: barato y tolera la recompresión.
@@ -459,6 +477,10 @@ def main():
                          "(auto: solo si nada agrupó)")
     ap.add_argument("--dedupe-threshold", type=int, default=8,
                     help="sólo con --group-by name: distancia Hamming máxima (0-64)")
+    ap.add_argument("--pairs", choices=["off", "unique", "balanced"], default="off",
+                    help="qué imágenes entran al manifest: 'off' = todas, 'unique' = sólo "
+                         "escenas con auténtica y manipulada, 'balanced' = además repite la "
+                         "auténtica una vez por variante para quedar 1:1")
     ap.add_argument("--no-copy", action="store_true",
                     help="no copiar imágenes; el manifest apunta a los archivos originales")
     ap.add_argument("--dry-run", action="store_true", help="solo diagnosticar, no escribir nada")
@@ -584,13 +606,58 @@ def main():
     print(f"tamaño de grupo: mayor {max(sizes.values())}, "
           f"con más de 1 archivo: {sum(1 for v in sizes.values() if v > 1)}")
 
+    # ---- selección de pares ----------------------------------------------
+    # `off` deja todo. `unique` se queda sólo con las escenas que tienen las dos
+    # clases, para que la única diferencia entre clases sea la edición y no la
+    # escena. `balanced` además emite una auténtica por cada variante manipulada:
+    # cada escena pesa lo mismo en ambas clases y el conjunto queda 1:1.
+    emit = []                          # (key, key de la manipulada que lo duplica o None)
+    if a.pairs == "off":
+        emit = [(k, None) for k in all_keys]
+    else:
+        by_group = defaultdict(lambda: {"a": [], "t": []})
+        for k, g in zip(all_keys, all_groups):
+            by_group[g]["a" if k.startswith("auth:") else "t"].append(k)
+        mixed = {g: v for g, v in by_group.items() if v["a"] and v["t"]}
+        only_t = {g: v for g, v in by_group.items() if v["t"] and not v["a"]}
+        only_a = {g: v for g, v in by_group.items() if v["a"] and not v["t"]}
+        if not mixed:
+            sys.exit(f"--pairs {a.pairs}: ningún grupo tiene auténtica y manipulada a la "
+                     "vez; no queda nada que entrenar. Revisá el agrupamiento.")
+
+        for g, v in mixed.items():
+            for i, k in enumerate(v["t"]):
+                emit.append((k, None))
+                if a.pairs == "balanced":
+                    # round-robin: si la escena tiene 2 auténticas se usan las dos
+                    emit.append((v["a"][i % len(v["a"])], k))
+            if a.pairs == "unique":
+                emit += [(k, None) for k in v["a"]]
+
+        n_t = sum(1 for k, _ in emit if not k.startswith("auth:"))
+        n_a = sum(1 for k, _ in emit if k.startswith("auth:"))
+        n_dup = sum(1 for _, owner in emit if owner is not None)
+        print(f"\nPareado (--pairs {a.pairs}): {len(mixed)} grupos mixtos de {len(by_group)}")
+        print(f"  descartados: {len(only_t)} grupos sólo manipulada "
+              f"({sum(len(v['t']) for v in only_t.values())} img) | "
+              f"{len(only_a)} sólo auténtica ({sum(len(v['a']) for v in only_a.values())} img)")
+        print(f"  filas: {len(emit)} ({n_t} manipuladas + {n_a} auténticas) | "
+              f"imágenes únicas: {len({k for k, _ in emit})}")
+        if n_dup:
+            uniq_a = len({k for k, _ in emit if k.startswith("auth:")})
+            print(f"  auténticas: {uniq_a} únicas -> {n_a} filas "
+                  f"({n_a / max(uniq_a, 1):.1f}x)")
+
     # ---- copiar y escribir manifest --------------------------------------
     if not a.dry_run:
         (out / "images").mkdir(parents=True, exist_ok=True)
         (out / "masks").mkdir(parents=True, exist_ok=True)
 
-    rows, used = [], set()
+    used = set()
     fracs, bad_size = [], []
+    tpl = {}                           # key -> fila, una por archivo único
+    path_of = dict(zip(all_keys, all_paths))
+    group_of = dict(zip(all_keys, all_groups))
 
     def dst_name(stem: str, ext: str, auth: bool) -> str:
         # El stem tiene que ser único: también se usa como nombre de máscara.
@@ -602,9 +669,11 @@ def main():
         used.add(name.lower())
         return f"{name}{ext}"
 
-    for idx, k in enumerate(all_keys):
+    # Una pasada por archivo único: copiar y validar dos veces la misma auténtica
+    # sería desperdiciar tiempo y ensuciar el conteo del área manipulada.
+    for k in dict.fromkeys(k for k, _ in emit):
         auth = k.startswith("auth:")
-        src = all_paths[idx]
+        src = path_of[k]
         w, h = dims[k]
 
         # El nombre de archivo sale del pair key (identidad del archivo), no del
@@ -637,11 +706,20 @@ def main():
             else:
                 mask_ref = str(mp.resolve())
 
-        rows.append({
+        tpl[k] = {
             "file": img_ref, "mask": mask_ref, "label": 0 if auth else 1,
-            "group": all_groups[idx], "source": "authentic" if auth else "tampered",
+            "group": group_of[k], "source": "authentic" if auth else "tampered",
             "width": w, "height": h,
-        })
+        }
+
+    # Expandir los pares. Si una manipulada no pasó la validación, su auténtica
+    # duplicada también se cae; si no, el 1:1 se rompe.
+    rows = []
+    for k, owner in emit:
+        if owner is not None and owner not in tpl:
+            continue
+        if k in tpl:
+            rows.append(dict(tpl[k]))
 
     med = statistics.median(fracs) if fracs else float("nan")
     n_auth = sum(r["label"] == 0 for r in rows)
@@ -656,7 +734,11 @@ def main():
     if n_auth and n_auth / max(n_tamp, 1) < 0.4:
         print("AVISO: hay muchas menos auténticas que manipuladas (desbalance). "
               "train.py lo compensa con pos_weight, pero conviene reportar balanced accuracy y AUC.")
-    if auths and matched < len(auths):
+    if a.pairs != "off":
+        print(f"NOTA: --pairs {a.pairs} descarta las escenas de una sola clase "
+              f"({sum(len(v['t']) for v in only_t.values())} manipuladas y "
+              f"{sum(len(v['a']) for v in only_a.values())} auténticas); ver el resumen de arriba.")
+    elif auths and matched < len(auths):
         if content:
             print(f"NOTA: {len(auths) - matched} auténticas no comparten grupo con ninguna "
                   "manipulada: su versión editada no está en el release, o la edición es tan "

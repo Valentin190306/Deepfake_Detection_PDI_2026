@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from dataset import MapDataset, apply_splits, load_packed, read_manifest
+from dataset import MapDataset, apply_splits, dedupe_rows, load_packed, read_manifest
 from model import build_model
 from train import metrics
 
@@ -128,6 +128,13 @@ def main():
         splits = json.loads(Path(a.splits).read_text())
         train_rows, val_rows = apply_splits(rows, splits)
         sel = val_rows if a.split == "val" else train_rows
+
+    # El manifest pareado repite la auténtica por cada variante manipulada: para
+    # medir se cuenta una vez por foto, si no la misma imagen pesa varias veces.
+    n_sel = len(sel)
+    sel = dedupe_rows(sel)
+    if len(sel) != n_sel:
+        print(f"{a.split}: {n_sel} filas -> {len(sel)} únicas (manifest pareado)")
 
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
     cfg = ck["cfg"]

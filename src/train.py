@@ -24,7 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import MapDataset, apply_splits, load_packed, make_splits, pos_weight, read_manifest
+from dataset import (MapDataset, apply_splits, dedupe_rows, load_packed, make_splits,
+                     pos_weight, read_manifest)
 from model import build_model, n_params
 
 
@@ -145,6 +146,9 @@ def main():
     # ejecución
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val-frac", type=float, default=0.25,
+                    help="fracción de grupos para validación (sólo al crear el split; "
+                         "si --splits ya existe se respeta el guardado)")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--resplit", action="store_true", help="regenerar el split aunque exista")
     ap.add_argument("--fresh", action="store_true", help="ignorar last.pt y empezar de cero")
@@ -166,10 +170,19 @@ def main():
     if splits_path.exists() and not a.resplit:
         splits = json.loads(splits_path.read_text())
     else:
-        splits = make_splits(rows, seed=a.seed)
+        splits = make_splits(rows, val_frac=a.val_frac, seed=a.seed)
         splits_path.parent.mkdir(parents=True, exist_ok=True)
         splits_path.write_text(json.dumps(splits, indent=2))
     train_rows, val_rows = apply_splits(rows, splits)
+
+    # `--pairs balanced` repite la auténtica una vez por variante: en train eso es
+    # el punto (cada escena pesa igual), pero en validación la misma foto contaría
+    # varias veces y torcería el umbral y las métricas.
+    n_val = len(val_rows)
+    val_rows = dedupe_rows(val_rows)
+    if len(val_rows) != n_val:
+        print(f"val: {n_val} filas -> {len(val_rows)} únicas "
+              f"(el manifest repite auténticas por escena)")
 
     _, meta, index = load_packed(a.packed)
     if int(meta["size"]) != a.size:

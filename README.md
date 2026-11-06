@@ -177,7 +177,56 @@ posiblemente invertidas (`--invert`).
 
 > El dataset tiene **2010 manipuladas y 414 auténticas** (desbalance 5:1). El
 > entrenamiento lo compensa con `pos_weight` y reporta balanced accuracy / AUC,
-> no solo accuracy.
+> no solo accuracy. Con `--pairs balanced` el conjunto queda 1:1 (ver 3.3).
+
+### 3.3 Escenas con las dos clases (`--pairs`)
+
+El agrupamiento por contenido resuelve la **fuga** (la misma foto en train y en
+validación), pero no la **confusión escena ↔ clase**. Si una manipulada sale de
+una escena que nunca aparece como auténtica, el modelo puede aprender "esta foto
+es trucada" mirando el fondo, el encuadre o el tamaño, en vez de "esta zona está
+editada". En IMD2020 eso es la mayoría del dataset: de **1606 escenas, sólo 264
+tienen las dos clases**.
+
+`--pairs` recorta el manifest a esas escenas:
+
+| modo | qué deja | filas | imágenes únicas | `pos_weight` |
+|---|---|---|---|---|
+| `off` (default) | todo | 2424 | 2424 | 0.21 |
+| `unique` | sólo escenas mixtas, una fila por archivo | 1042 | 1042 | 0.34 |
+| `balanced` | escenas mixtas, **una auténtica por cada variante** | 1552 | 1042 | **1.00** |
+
+```bash
+python src/prepare_imd2020.py --src <carpeta_kaggle> --out data --prefix imd_ \
+    --group-by content --pairs balanced
+```
+
+Detalles de `balanced`:
+
+- Cada escena pesa lo mismo en las dos clases: una escena con 1 auténtica y 3
+  variantes aporta 3 auténticas y 3 manipuladas. Es el punto del modo.
+- Las copias **apuntan al mismo archivo**, no se duplican bytes. `extract_maps.py`
+  deduplica por stem antes de correr TruFor (una inferencia por foto, no 2.9), y
+  `train.py` / `eval.py` deduplican la **validación** para que una foto repetida
+  no pese varias veces en el umbral ni en las métricas. El train conserva las
+  repeticiones a propósito.
+- Las 2 escenas con 2 auténticas distintas usan round-robin, así entran las dos.
+- Si se descarta una manipulada por tamaño de máscara, su auténtica duplicada
+  también se cae, para no romper el 1:1.
+
+**Qué se pierde.** Se descartan 1194 escenas que sólo tienen manipuladas (1234
+imágenes) y 148 que sólo tienen auténticas: **−61% de las manipuladas**. Con
+`--val-frac 0.25` la validación queda con **61 auténticas únicas** y 61 escenas
+(400 filas antes de deduplicar); con 61 negativos el AUC se mueve ±0.05 con
+cualquier cambio, y `train.py` elige el mejor checkpoint por AUC, así que puede
+quedarse con una época de suerte. Si el número final importa, repetir con 3
+semillas (`--seed`) y reportar media ± desvío. Sigue siendo un ViT desde cero
+sobre 264 escenas: el techo de generalización es bajo, y eso hay que decirlo
+junto con el resultado.
+
+> **Al cambiar de modo hay que borrar el split viejo** (`runs/splits.json`). Los
+> grupos pasan de 1606 a 264 y `apply_splits` falla con un mensaje explícito
+> ("El split no conoce N grupos") en vez de arrancar en silencio.
 
 ---
 
@@ -240,7 +289,11 @@ python src/train.py --manifest data/manifest.csv --packed packed/raw__s384 \
 ```
 
 - **Split por grupo**, estratificado y reproducible (`runs/splits.json`). Se
-  reutiliza en todas las corridas salvo `--resplit`.
+  reutiliza en todas las corridas salvo `--resplit`. `--val-frac` (default 0.25)
+  sólo se usa al crear el split; si el archivo ya existe, manda el guardado.
+- **Manifest pareado**: si viene de `--pairs balanced`, el train conserva las
+  auténticas repetidas (es el punto) y la validación se deduplica por foto.
+  `pos_weight` sale ~1.0, así que la loss no compensa nada.
 - **ViT desde cero**: patch embed `Conv2d(C, dim, 16, 16)`, `depth=8`, `dim=384`,
   `heads=6`, pre-LN, SDPA, dropout + stochastic depth + LayerScale (~15 M params).
 - **Prior de TruFor**: el score global entra como token extra y el logit final es
@@ -264,6 +317,7 @@ Salidas en `--out`: `last.pt` (cada época, reanudable), `best.pt` (mejor AUC),
 | descarga IMD2020 (600 MB) | 1–2 min |
 | preparación + manifest | 1–2 min |
 | extracción TruFor (2424 imgs, max-side 1280) | 30–60 min |
+| extracción TruFor con `--pairs balanced` (1042 imgs) | 25–30 min |
 | empaquetado local | ~2 min |
 | 150 épocas (S=384, bs=16) | 1–1.5 h |
 
@@ -322,8 +376,10 @@ desde `last.pt`.
    17 versiones de una misma foto bajo ids distintos. Si aparece un release
    mejor, `prepare_imd2020.py` lo acepta igual: el agrupamiento por contenido no
    depende de los nombres.
-4. **Desbalance 5:1.** Reportar balanced accuracy, F1, AUC y AP.
-5. **ViT desde cero con ~2400 imágenes** es el punto más débil del diseño. El
+4. **Desbalance 5:1** en el manifest completo. Con `--pairs balanced` queda 1:1
+   (776/776), a costa de usar 264 escenas y 1042 imágenes únicas. En los dos casos
+   reportar balanced accuracy, F1, AUC y AP.
+5. **ViT desde cero con ~1000–2400 imágenes** es el punto más débil del diseño. El
    prior + logit residual garantizan no arrancar peor que TruFor. Si no alcanza,
    la palanca es pasar a un backbone preentrenado (`timm`) sin cambiar el resto.
 6. **TruFor es de uso no comercial.** Hay que citar a los autores si se publican

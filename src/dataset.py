@@ -35,6 +35,24 @@ def read_manifest(path: Path) -> list[dict]:
     return rows
 
 
+def dedupe_rows(rows: list[dict]) -> list[dict]:
+    """Una fila por archivo y etiqueta.
+
+    `prepare_imd2020.py --pairs balanced` repite la auténtica una vez por cada
+    variante manipulada, para que las dos clases pesen igual. Eso está bien para
+    entrenar (cada escena aporta lo mismo) pero no para medir: la misma foto
+    contaría varias veces en la validación. Acá se colapsan las copias.
+    """
+    seen, out = set(), []
+    for r in rows:
+        key = (r["file"], r["label"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def load_packed(base: str | Path):
     """Carga packed.npy (+ .json) y devuelve (memmap, meta, stem -> fila)."""
     base = Path(base)
