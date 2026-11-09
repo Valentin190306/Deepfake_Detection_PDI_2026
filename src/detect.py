@@ -21,7 +21,7 @@ Uso:
     python src/detect.py mis_imagenes/ --json runs/resultados.json
 
 El preprocesamiento de la entrada (resize, suavizado, brillo, blancos, CLAHE,
-realce) se configura en la lista PREPROC, más abajo. Para comparar varias
+realce, sobel, laplaciano) se configura en la lista PREPROC, más abajo. Para comparar varias
 configuraciones sobre un directorio, ver run_experiments().
 
 El modelo es TruFor (Guillaro et al., CVPR 2023), GRIP-UNINA. Licencia de uso
@@ -61,6 +61,8 @@ PREPROC = [
     ("blancos",   False, {"umbral": 200, "fuerza": 0.5}),
     ("clahe",     False, {"clip": 2.0, "grilla": 8}),
     ("realce",    False, {"sigma": 1.0, "cantidad": 0.5}),
+    ("sobel",     False, {"ksize": 3}),
+    ("laplaciano", False, {"modo": "realce", "cantidad": 0.5}),
 ]
 
 
@@ -181,6 +183,45 @@ def sharpen(img, sigma=1.0, cantidad=0.5):
     return _to_uint8(x + cantidad * (x - cv2.GaussianBlur(x, (0, 0), sigma)))
 
 
+def _normalize(d, con_signo):
+    """
+    Lleva una derivada a uint8 escalando por el percentil 99 de |d| (el mismo
+    para los tres canales). Con signo queda centrada en gris (128); sin signo
+    (una magnitud) va de negro a blanco.
+    """
+    escala = max(float(np.percentile(np.abs(d), 99)), 1e-6)
+    return _to_uint8(128 + 127 * d / escala) if con_signo else _to_uint8(255 * d / escala)
+
+
+def gradient(img, ksize=3):
+    """
+    Primera derivada: magnitud del gradiente de Sobel, por canal. Da una imagen
+    de bordes (negro en las zonas planas), normalizada para usar todo el rango.
+    """
+    x = img.astype(np.float32)
+    gx = cv2.Sobel(x, cv2.CV_32F, 1, 0, ksize=ksize)
+    gy = cv2.Sobel(x, cv2.CV_32F, 0, 1, ksize=ksize)
+    return _normalize(np.hypot(gx, gy), con_signo=False)
+
+
+def laplacian(img, modo="residuo", cantidad=1.0):
+    """
+    Segunda derivada (laplaciano 3x3, centro -4), por canal:
+      residuo: solo el laplaciano, centrado en gris. Es lo que queda del pasa alto.
+      realce : img - cantidad * laplaciano, el realce clásico con laplaciano.
+    Precedido por un suavizado gaussiano es el LoG (Marr-Hildreth): el Gauss
+    evita que la derivada amplifique el ruido, pero ese ruido es justamente lo
+    que mira Noiseprint++, así que con sigma grande TruFor pierde su señal.
+    """
+    x = img.astype(np.float32)
+    lap = cv2.Laplacian(x, cv2.CV_32F, ksize=1)
+    if modo == "residuo":
+        return _normalize(lap, con_signo=True)
+    if modo == "realce":
+        return _to_uint8(x - cantidad * lap)
+    raise ValueError(f"laplaciano: modo '{modo}' desconocido (residuo, realce)")
+
+
 PASOS = {
     "resize": resize,
     "suavizado": denoise,
@@ -188,6 +229,8 @@ PASOS = {
     "blancos": reduce_whites,
     "clahe": clahe,
     "realce": sharpen,
+    "sobel": gradient,
+    "laplaciano": laplacian,
 }
 
 
