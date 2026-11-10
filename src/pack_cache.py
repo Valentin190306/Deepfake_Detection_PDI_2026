@@ -9,7 +9,7 @@ lento y frágil. Este script los junta una vez en un array contiguo local:
 El .npy se abre con mmap_mode="r", así que no hace falta tener 2 GB de RAM.
 Hay que re-empaquetar si se agregan imágenes o se cambia el cache.
 
-    python src/pack_cache.py --cache cache/raw__s384 --out packed/raw__s384
+    python src/pack_cache.py --cache cache/raw__s384__ms1280 --out packed/raw__s384
 """
 import argparse
 import json

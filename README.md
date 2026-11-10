@@ -19,9 +19,10 @@ pensado para correr en una **GPU T4 de Google Colab**.
 
 ```
 imagen (tamaño variable)
-   │  src/preprocess.py      variantes ANTES de TruFor (raw, jpeg70, blur1, ...)
+   │  --max-side             achica el lado mayor (memoria de la GPU), sin deformar
+   │  src/preprocess.py      variantes ANTES de TruFor (raw, log05, jpeg70, ...)
    ▼
-TruFor (congelado)  ──►  score + mapa + confianza  (resolución nativa)
+TruFor (congelado)  ──►  score + mapa + confianza
    │  src/maps.py           NORMALIZACIÓN DE TAMAÑO: S×S + uint8
    ▼
 cache  ──►  src/pack_cache.py  ──►  memmap local (N, 5, S, S)
@@ -92,10 +93,18 @@ Es idempotente.
 ### 2.4 Verificar
 
 ```bash
-python src/detect.py third_party/trufor/images/
+python src/detect.py third_party/trufor/images/ --variant raw --max-side 0
 ```
 
-Esperado: ~`0.19` para las *pristine* y ~`0.99` para las *tampered*.
+Esperado: ~`0.19` para las *pristine* y ~`0.99` para las *tampered*. Se corre
+sin filtro ni límite de tamaño para comparar con los valores de TruFor.
+
+Sin esos flags, `detect.py` usa la configuración calibrada en la rama `testing`:
+achica la imagen a 1000 px de lado conservando el aspecto, aplica `log05`
+(Gauss σ=0.5 → laplaciano) y decide con el umbral **0.1315**. Ese umbral salió
+de 21 imágenes propias (balanced accuracy 0.764 con validación cruzada, contra
+0.718 sin filtro). Con tan pocas imágenes, la diferencia es de una imagen: hay
+que confirmarlo con más datos antes de confiar en él.
 
 ---
 
@@ -245,7 +254,11 @@ El presupuesto de píxeles es `S×S`: cualquier método descarta la misma cantid
 información; lo que cambia es *cómo*.
 
 - **Resize "squash" a S×S**, sin padding: no deforma nada relevante para una
-  clasificación y no gasta píxeles en relleno.
+  clasificación y no gasta píxeles en relleno. Se descartó el *letterbox*
+  (conservar el aspecto y rellenar): el ancho del relleno le muestra al ViT la
+  proporción de la foto, que no dice nada de la edición pero puede correlacionar
+  con la clase en el dataset, y en una foto 4:3 gasta un 25% de los píxeles en
+  relleno, justo los que necesitan las regiones editadas chicas.
 - **Mapa de manipulación: `blend`** = `0.5·area + 0.5·max`. `area` conserva la
   forma pero diluye regiones chicas; `max` conserva el pico pero engorda el área.
   El promedio conserva las dos cosas.
@@ -260,13 +273,19 @@ python src/extract_maps.py --manifest data/manifest.csv --cache cache \
     --variants raw --map-size 384 --max-side 1280
 ```
 
-- `--variants`: preprocesamientos **antes** de TruFor (`raw`, `jpeg70`, `jpeg90`,
-  `blur1`, `resize1280`, `resize1024+jpeg70`; ver `src/preprocess.py`).
-- `--max-side`: límite técnico de memoria para la T4 (TruFor trabaja a resolución
-  nativa; las fotos de ~3000×4400 hacen OOM). No es una variante científica.
+- `--variants`: preprocesamientos **antes** de TruFor (`raw`, `log05`, `jpeg70`,
+  `jpeg90`, `blur1`, `resize1280`, `resize1024+jpeg70`; ver `src/preprocess.py`).
+  `log05` (Gauss σ=0.5 → laplaciano) es el filtro que ganó el barrido de
+  `scripts/preproc_test.py` en la rama `testing`.
+- `--max-side` (default 1000): límite técnico de memoria de la GPU (TruFor trabaja
+  a resolución nativa; las fotos de ~3000×4400 hacen OOM). Baja el lado mayor
+  conservando el aspecto y se aplica **antes** de la variante. No es una variante
+  científica.
 - Salida: `cache/<variante>__s<S>__ms<max>/<stem>.npz` con `map`, `conf`, `score`,
   `rgb` y `orig_hw`. La clave incluye tamaño y max-side, así que cambiar cualquiera
-  de los dos no reutiliza mapas viejos.
+  de los dos no reutiliza mapas viejos. Antes el max-side se aplicaba después de la
+  variante: para `raw` da lo mismo, pero los caches viejos de `jpeg*`/`blur1` se
+  hicieron con el otro orden y conviene volver a extraerlos.
 - Es **reanudable** y escribe de forma atómica.
 
 ### 4.4 Empaquetado

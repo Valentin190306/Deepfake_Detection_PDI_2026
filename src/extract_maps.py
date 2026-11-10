@@ -2,7 +2,7 @@
 
 Por cada fila del manifest y cada variante:
 
-    imagen -> preprocess.apply_variant() -> TruFor -> maps.normalize_maps()
+    imagen -> --max-side -> preprocess.apply_variant() -> TruFor -> maps.normalize_maps()
 
 y se guarda un .npz con los mapas YA normalizados al tamaño del ViT. Es
 obligatorio normalizar acá: a resolución nativa los mapas de IMD2020 ocuparían
@@ -16,7 +16,9 @@ Salida: <cache>/<clave>/<stem>.npz con
     orig_hw  int32 (2)        alto, ancho originales (metadata)
 
 La clave del cache incluye variante, tamaño y max-side, así que cambiar
-cualquiera de los tres no reutiliza mapas viejos por error.
+cualquiera de los tres no reutiliza mapas viejos por error. Ojo: antes el
+max-side se aplicaba DESPUÉS de la variante; para raw da lo mismo, pero los
+caches viejos de jpeg/blur se hicieron con el otro orden.
 
 Es REANUDABLE (saltea lo ya cacheado) y escribe de forma atómica: si Colab se
 desconecta a mitad de camino no quedan archivos corruptos.
@@ -64,8 +66,9 @@ def main():
     ap.add_argument("--variants", nargs="+", default=["raw"])
     ap.add_argument("--map-size", type=int, default=384,
                     help="lado S al que se normalizan los mapas (entrada del ViT)")
-    ap.add_argument("--max-side", type=int, default=0,
-                    help="si >0, baja el lado mayor a este valor ANTES de TruFor (memoria en T4)")
+    ap.add_argument("--max-side", type=int, default=1000,
+                    help="si >0, baja el lado mayor a este valor conservando el aspecto, antes "
+                         "de la variante y de TruFor (memoria de la GPU; default: 1000)")
     ap.add_argument("--heat-mode", default="blend", choices=["area", "max", "blend"])
     ap.add_argument("--conf-mode", default="area", choices=["area", "max", "blend"])
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -120,9 +123,10 @@ def main():
             stem = Path(r["file"]).stem
             src = Path(r["file"]) if Path(r["file"]).is_absolute() else root / r["file"]
             try:
-                arr = apply_variant(np.array(Image.open(src).convert("RGB")), v)
+                arr = np.array(Image.open(src).convert("RGB"))
                 if a.max_side:
                     arr = resize_max_side(arr, a.max_side)
+                arr = apply_variant(arr, v)
                 rgb = to_tensor(arr)
                 try:
                     score, heat, conf = analyze(model, rgb, device)

@@ -20,6 +20,14 @@ Uso:
     # Resultados a JSON para procesar después
     python src/detect.py mis_imagenes/ --json runs/resultados.json
 
+    # Sin filtro ni límite de tamaño (TruFor tal cual, como en el paper)
+    python src/detect.py mis_imagenes/ --variant raw --max-side 0
+
+Por defecto la imagen se achica (conservando el aspecto) hasta que el lado
+mayor mide 1000 px, se le aplica el filtro ganador del barrido de
+preprocesamientos (variante "log05": Gauss sigma=0.5 -> laplaciano) y el
+veredicto usa el umbral calibrado para esa variante (ver THRESHOLDS).
+
 El modelo es TruFor (Guillaro et al., CVPR 2023), GRIP-UNINA. Licencia de uso
 sin fines de lucro: hay que citar a los autores si se publican resultados.
 """
@@ -32,12 +40,33 @@ import numpy as np
 import torch
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from preprocess import VARIANTS, apply_variant  # noqa: E402
+from preprocess import max_side as limit_side  # noqa: E402
+
 # El código y los pesos de TruFor viven en third_party/ (no son nuestros).
 REPO = Path(__file__).resolve().parent.parent
 TRUFOR_SRC = REPO / "third_party" / "trufor" / "src"
 
 # Extensiones que PIL abre sin drama. Evita intentar cargar .txt, .npz, etc.
 IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+# Lado máximo con el que entra en una GPU de 8 GB (y con el que se calibraron
+# los umbrales de abajo).
+DEFAULT_MAX_SIDE = 1000
+DEFAULT_VARIANT = "log05"
+
+# Umbral calibrado por variante: el que maximizó la balanced accuracy en el
+# barrido de scripts/preproc_test.py (rama testing), sobre 21 imágenes propias
+# (10 auténticas, 11 manipuladas) limitadas a 1000 px. Con validación cruzada
+# de 5 folds, log05 dio balanced accuracy 0.764 contra 0.718 sin filtro.
+# Con tan pocas imágenes la diferencia es de ~1 imagen: si cambia el filtro,
+# el límite de tamaño o el tipo de imágenes, hay que recalibrar.
+# Las variantes que no están acá usan 0.5, el umbral original de TruFor.
+THRESHOLDS = {
+    "log05": 0.1315,
+    "raw": 0.3525,
+}
 
 
 def find_weights():
@@ -76,15 +105,21 @@ def load_model(device):
     return model, weights
 
 
-def preprocess(path):
+def preprocess(path, variant=DEFAULT_VARIANT, max_side=DEFAULT_MAX_SIDE):
     """
-    OJO: sin resize. TruFor acepta cualquier tamaño y redimensionar destruiría
-    justamente las huellas de bajo nivel (ruido, artefactos) que busca.
-    Solo RGB uint8 -> float en [0, 1).
+    RGB uint8 -> (límite de tamaño) -> variante -> float en [0, 1).
+
+    TruFor acepta cualquier tamaño, pero las fotos grandes no entran en la GPU:
+    si max_side > 0 se baja el lado mayor a ese valor conservando el aspecto
+    (nunca se agranda ni se deforma). Achicar borra parte de las huellas de
+    bajo nivel que busca TruFor, así que con max_side=0 no se toca.
     """
     arr = np.array(Image.open(path).convert("RGB"))
-    t = torch.tensor(arr.transpose(2, 0, 1), dtype=torch.float) / 256.0
-    return t.unsqueeze(0), arr  # (1,3,H,W) para la red, y el array original para visualizar
+    if max_side:
+        arr = limit_side(arr, max_side)
+    t = torch.tensor(apply_variant(arr, variant).transpose(2, 0, 1), dtype=torch.float) / 256.0
+    # (1,3,H,W) para la red, y la imagen sin filtrar (mismo tamaño que los mapas) para visualizar
+    return t.unsqueeze(0), arr
 
 
 @torch.no_grad()
@@ -149,10 +184,21 @@ def main():
     ap.add_argument("--out", default="runs/deteccion", help="carpeta de salida para las visualizaciones")
     ap.add_argument("--viz", action="store_true", help="guardar PNG con heatmap por imagen")
     ap.add_argument("--json", default=None, help="guardar todos los scores en este .json")
-    ap.add_argument("--threshold", type=float, default=0.5,
-                    help="score por encima del cual se declara MANIPULADA")
+    ap.add_argument("--variant", default=DEFAULT_VARIANT, choices=list(VARIANTS),
+                    help=f"filtro antes de TruFor (default: {DEFAULT_VARIANT}; raw = sin filtro)")
+    ap.add_argument("--max-side", type=int, default=DEFAULT_MAX_SIDE,
+                    help="lado máximo en px; las imágenes más grandes se achican conservando el "
+                         f"aspecto (0 = no achicar, default: {DEFAULT_MAX_SIDE})")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="score por encima del cual se declara MANIPULADA "
+                         "(default: el calibrado para la variante, ver THRESHOLDS; si no hay, 0.5)")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     args = ap.parse_args()
+    if args.threshold is None:
+        args.threshold = THRESHOLDS.get(args.variant, 0.5)
+        if args.max_side != DEFAULT_MAX_SIDE:
+            print(f"AVISO: el umbral de '{args.variant}' se calibró con --max-side {DEFAULT_MAX_SIDE}; "
+                  f"con {args.max_side} puede no ser el mejor.")
 
     images = collect_images(args.input)
     if not images:
@@ -163,16 +209,17 @@ def main():
     )
     model, weights = load_model(device)
     print(f"Modelo: TruFor | pesos: {weights.name} | dispositivo: {device}")
-    print(f"{len(images)} imagen(es) | umbral: {args.threshold}\n")
+    print(f"{len(images)} imagen(es) | variante: {args.variant} | "
+          f"lado máximo: {args.max_side or 'sin límite'} | umbral: {args.threshold}\n")
 
     results = []
     for path in images:
-        rgb, original = preprocess(path)
+        rgb, original = preprocess(path, args.variant, args.max_side)
         try:
             score, heatmap, conf_map = analyze(model, rgb, device)
         except torch.cuda.OutOfMemoryError:
-            # Imágenes grandes no entran en 8 GB. Reintentamos en CPU (lento pero
-            # exacto) antes que redimensionar, que arruinaría la detección.
+            # Si aun con el límite de tamaño no entra (o se usó --max-side 0),
+            # reintentamos en CPU: lento pero sin achicar más la imagen.
             print(f"  (sin memoria GPU en {path.name}, reintento en CPU)")
             torch.cuda.empty_cache()
             model.to("cpu")
@@ -186,7 +233,9 @@ def main():
             "file": str(path),
             "score": score,
             "verdict": verdict,
-            "size": list(original.shape[:2]),
+            "variant": args.variant,
+            "threshold": args.threshold,
+            "size": list(original.shape[:2]),   # tamaño con el que entró a TruFor
             # Cuánto del área se marca como manipulada: útil para descartar
             # activaciones dispersas que son ruido y no una región editada.
             "area_sospechosa": float((heatmap >= 0.5).mean()),

@@ -14,6 +14,12 @@ numpy
 pillow
 matplotlib
 
+# Filtro log05 de src/preprocess.py (Gauss + laplaciano). Headless: sin GUI
+opencv-python-headless
+
 # Métricas de clasificación (AUC / AP) y descarga del dataset en Colab
 scikit-learn
 kagglehub
+
+# InpaintCOCO desde Hugging Face (scripts/train_local.py)
+datasets

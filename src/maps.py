@@ -13,7 +13,12 @@ El presupuesto de píxeles es SxS: cualquier método descarta la misma cantidad
 de información, lo que cambia es *cómo*. Por eso:
 
   - resize "squash" a SxS (sin padding): no deforma nada importante para una
-    clasificación y no gasta píxeles en relleno.
+    clasificación y no gasta píxeles en relleno. Se descartó el letterbox
+    (conservar el aspecto y rellenar): el ancho del relleno le muestra al ViT
+    la proporción de la foto, que no dice nada de la edición pero puede
+    correlacionar con la clase en el dataset (el modelo aprendería el atajo);
+    además, en una foto 4:3 se pierde un 25% de los píxeles en relleno, justo
+    lo que necesitan las regiones editadas chicas.
   - heatmap: `blend` = 0.5*area + 0.5*max. `area` conserva la forma pero diluye
     regiones chicas; `max` conserva el pico pero engorda el área. El promedio
     de ambos conserva las dos cosas.

@@ -12,12 +12,14 @@ Para agregar una variante nueva:
   3) declarar la variante en VARIANTS
 No hay que tocar extract_maps.py ni dataset.py.
 
-`--max-side` de extract_maps.py es aparte: es un límite técnico de memoria
-para la T4, no una variante científica.
+`--max-side` de extract_maps.py y detect.py es aparte: es un límite técnico
+de memoria para la GPU, no una variante científica. Se aplica ANTES de la
+variante, así los filtros trabajan a la resolución que ve TruFor.
 """
 import io
 from functools import partial
 
+import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -49,6 +51,21 @@ def max_side(img: np.ndarray, max_side: int) -> np.ndarray:
     return np.array(Image.fromarray(img).resize(size, Image.LANCZOS))
 
 
+def log_residual(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Gauss (sigma) -> laplaciano 3x3, devuelto como residuo centrado en gris.
+
+    Es el filtro que ganó el barrido de scripts/preproc_test.py (rama testing):
+    el Gauss chico saca el ruido más fino y el laplaciano deja sólo las altas
+    frecuencias. El residuo se escala por el percentil 99 de |laplaciano| (el
+    mismo para los tres canales) para usar todo el rango uint8. Replica
+    exactamente aquel barrido: el umbral calibrado en detect.py depende de eso.
+    """
+    blurred = cv2.GaussianBlur(img, (0, 0), sigma)
+    lap = cv2.Laplacian(blurred.astype(np.float32), cv2.CV_32F, ksize=1)
+    scale = max(float(np.percentile(np.abs(lap), 99)), 1e-6)
+    return np.clip(np.rint(128 + 127 * lap / scale), 0, 255).astype(np.uint8)
+
+
 STEPS = {
     "identity": identity,
     "jpeg70": partial(jpeg, quality=70),
@@ -56,6 +73,7 @@ STEPS = {
     "blur1": partial(gaussian, radius=1.0),
     "resize1280": partial(max_side, max_side=1280),
     "resize1024": partial(max_side, max_side=1024),
+    "log05": partial(log_residual, sigma=0.5),
 }
 
 VARIANTS = {
@@ -65,6 +83,7 @@ VARIANTS = {
     "blur1": ["blur1"],
     "resize1280": ["resize1280"],
     "resize1024+jpeg70": ["resize1024", "jpeg70"],
+    "log05": ["log05"],
 }
 
 
