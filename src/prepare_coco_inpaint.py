@@ -63,9 +63,16 @@ def scene_id(row: dict, index: int) -> str:
     return f"{index:04d}"
 
 
-def _save_png(img: Image.Image, path: Path):
+def _atomic_save(img: Image.Image, path: Path):
+    """Guarda en un .tmp y renombra: si Colab se corta, no deja una PNG truncada."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    img.convert("RGB").save(path, format="PNG", optimize=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    img.save(tmp, format="PNG", optimize=True)
+    tmp.replace(path)
+
+
+def _save_png(img: Image.Image, path: Path):
+    _atomic_save(img.convert("RGB"), path)
 
 
 def prepare(rows, out: Path, overwrite: bool = False) -> list[dict]:
@@ -110,8 +117,7 @@ def prepare(rows, out: Path, overwrite: bool = False) -> list[dict]:
             _save_png(fake, dst_fake)
         if overwrite or not dst_mask.exists():
             bin_mask = (np.array(mask.convert("L")) > 127).astype(np.uint8) * 255
-            dst_mask.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(bin_mask).save(dst_mask, format="PNG", optimize=True)
+            _atomic_save(Image.fromarray(bin_mask), dst_mask)
 
         manifest.append({"file": rel_fake, "mask": rel_mask, "label": 1, "group": sid,
                          "source": "inpaintcoco", "width": w, "height": h,

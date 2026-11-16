@@ -295,6 +295,10 @@ El script agrega `dataset`, prefija `group` con el nombre del conjunto
 manifests originales son relativos a su propia carpeta). El resultado es
 específico de la máquina, pero se regenera en segundos.
 
+Antes de escribir nada valida que existan los `.npy` y `.json` de cada
+`--input`: si falta uno, falla en el merge nombrando el dataset, en vez de dejar
+un manifest que explota recién en `train.py`.
+
 Con la mezcla natural (sin submuestrear) quedan ~3100 escenas y ~4072 filas,
 60% COCO / 40% IMD. El split estratifica por `(dataset, etiqueta)`, así que
 ningún conjunto queda con una sola clase en validación.

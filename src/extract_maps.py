@@ -1,12 +1,12 @@
-"""Paso 1: correr TruFor una vez por imagen y cachear lo que consume el ViT.
+"""Paso 1: correr TruFor una vez por imagen y cachear lo que consume el clasificador.
 
 Por cada fila del manifest y cada variante:
 
     imagen -> preprocess.apply_variant() -> TruFor -> maps.normalize_maps()
 
-y se guarda un .npz con los mapas YA normalizados al tamaño del ViT. Es
+y se guarda un .npz con los mapas YA normalizados al tamaño del clasificador. Es
 obligatorio normalizar acá: a resolución nativa los mapas de IMD2020 ocuparían
-decenas de GB y el ViT de todos modos necesita una entrada fija.
+decenas de GB y el clasificador de todos modos necesita una entrada fija.
 
 Salida: <cache>/<clave>/<stem>.npz con
     map      uint8 (S,S)      mapa de manipulación, 0-255
@@ -63,7 +63,7 @@ def main():
     ap.add_argument("--cache", default="cache")
     ap.add_argument("--variants", nargs="+", default=["raw"])
     ap.add_argument("--map-size", type=int, default=384,
-                    help="lado S al que se normalizan los mapas (entrada del ViT)")
+                    help="lado S al que se normalizan los mapas (entrada del clasificador)")
     ap.add_argument("--max-side", type=int, default=0,
                     help="si >0, baja el lado mayor a este valor ANTES de TruFor (memoria en T4)")
     ap.add_argument("--heat-mode", default="blend", choices=["area", "max", "blend"])

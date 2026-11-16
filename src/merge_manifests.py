@@ -36,6 +36,13 @@ def load(path: Path, name: str, packed: str) -> list[dict]:
     path = Path(path)
     if not path.exists():
         raise SystemExit(f"No existe {path}")
+    # El manifest no sirve de nada si el paquete al que apunta no existe: el
+    # error aparecería recién al entrenar, después de mezclar todo.
+    npy, js = Path(packed).with_suffix(".npy"), Path(packed).with_suffix(".json")
+    if not npy.exists():
+        raise SystemExit(f"{name}: no existe {npy}. Corré src/pack_cache.py antes de mezclar.")
+    if not js.exists():
+        raise SystemExit(f"{name}: no existe {js} (lo escribe src/pack_cache.py).")
     root = path.resolve().parent
     out = []
     with open(path, newline="") as f:

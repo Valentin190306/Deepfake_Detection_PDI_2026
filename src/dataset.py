@@ -15,8 +15,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# Normalización ImageNet para el canal RGB (el ViT se entrena desde cero, pero
-# esto mantiene el RGB en un rango comparable al de los mapas).
+# Normalización ImageNet para el canal RGB: los backbones preentrenados la
+# esperan. Los mapas ya vienen en 0-1 y no se tocan.
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 

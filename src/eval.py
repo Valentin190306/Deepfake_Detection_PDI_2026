@@ -190,7 +190,7 @@ def main():
     ap.add_argument("--packed", default="",
                     help="base del .npy empaquetado; si el manifest trae la columna "
                          "`packed`, se usa la de cada fila")
-    ap.add_argument("--ckpt", default="runs/vit/best.pt")
+    ap.add_argument("--ckpt", default="runs/clasificador/best.pt")
     ap.add_argument("--out", default="runs/eval")
     ap.add_argument("--splits", default="runs/splits.json")
     ap.add_argument("--split", default="val", choices=["val", "train", "all"])

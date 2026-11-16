@@ -1,4 +1,4 @@
-"""Normalización de tamaño de los mapas de TruFor ANTES de que los use el ViT.
+"""Normalización de tamaño de los mapas de TruFor ANTES de que los use el clasificador.
 
 Por qué existe este paso
 ------------------------
@@ -79,7 +79,3 @@ def resize_rgb(rgb: np.ndarray, size: int) -> np.ndarray:
 
 def to_uint8(x: np.ndarray) -> np.ndarray:
     return np.rint(np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def from_uint8(a: np.ndarray) -> np.ndarray:
-    return a.astype(np.float32) / 255.0

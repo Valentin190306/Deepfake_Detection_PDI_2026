@@ -1,4 +1,4 @@
-"""Paso 3: entrenar el ViT clasificador sobre los mapas cacheados de TruFor.
+"""Paso 3: entrenar el clasificador sobre los mapas cacheados de TruFor.
 
 Reanudable: guarda last.pt cada época y, si existe, retoma desde ahí. best.pt
 son los pesos de la mejor época según AUC de validación. Todo se apoya en el
@@ -7,7 +7,7 @@ split por grupo guardado en --splits.
 Ejemplo para la T4 de Colab:
 
     python src/train.py --manifest data/manifest.csv --packed packed/raw__s384 \
-        --out runs/vit --epochs 150 --bs 16 --size 384
+        --backbone swin_t --ft partial --out runs/clasificador --epochs 150 --bs 16 --size 384
 """
 import argparse
 import copy
@@ -70,18 +70,14 @@ def best_threshold(y_true: np.ndarray, p: np.ndarray, metric: str = "bal_acc") -
 
 
 @torch.no_grad()
-def predict(model, loader, device, limit_batches: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """Predice sobre el loader. `limit_batches` es solo para depurar: cortar la
-    validación deja métricas sin sentido (AUC/AP quedan en NaN si cae en una sola
-    clase), así que el loop de entrenamiento la mide siempre completa."""
+def predict(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    """Predice sobre el loader completo (la validación no se trunca nunca)."""
     model.eval()
     ys, ps = [], []
-    for i, (x, y, score) in enumerate(loader):
+    for x, y, score in loader:
         logits = model(x.to(device), score.to(device))
         ps.append(torch.sigmoid(logits).float().cpu().numpy())
         ys.append(y.numpy().astype(int))
-        if limit_batches and i + 1 >= limit_batches:
-            break
     return np.concatenate(ys), np.concatenate(ps)
 
 
@@ -158,7 +154,7 @@ def main():
                     help="base del .npy empaquetado; si el manifest trae la columna "
                          "`packed`, se usa la de cada fila y esto se ignora")
     ap.add_argument("--splits", default="runs/splits.json")
-    ap.add_argument("--out", default="runs/vit")
+    ap.add_argument("--out", default="runs/clasificador")
     ap.add_argument("--channels", default="maps+rgb", choices=["maps+rgb", "maps"])
     # arquitectura: backbone preentrenado (default) o el ViT desde cero (control)
     ap.add_argument("--backbone", default="swin_t", choices=["scratch", *BACKBONES],
@@ -343,7 +339,6 @@ def main():
     ema = EMA(model, a.ema) if a.ema > 0 else None
     eval_model = copy.deepcopy(model).to(device) if ema else model
 
-    out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps({**cfg, **vars(a), "pos_weight_used": pw}, indent=2))
     log_path = out / "log.csv"
@@ -409,10 +404,8 @@ def main():
 
         if ema:
             eval_model.load_state_dict(ema.state_dict())
-        # La validación se mide SIEMPRE completa: --limit-steps solo acelera el
-        # entrenamiento del smoke test. Truncarla deja AUC/AP en NaN cuando las
-        # primeras imágenes del loader son todas de la misma clase (el manifest
-        # lista las manipuladas antes que las auténticas).
+        # La validación se mide siempre completa: --limit-steps sólo acelera el
+        # entrenamiento del smoke test.
         y_true, p = predict(eval_model, val_dl, device)
         if len(np.unique(y_true)) < 2:
             print("AVISO: la validación quedó con una sola clase: AUC y AP no se pueden "

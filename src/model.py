@@ -14,8 +14,6 @@ prior de TruFor (sirve para la loss auxiliar). El logit final es
 `vit_logit + alpha·logit(score)`, así que en la época 0 el modelo no puede
 arrancar peor que TruFor.
 """
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -184,8 +182,7 @@ class TruForBackboneClassifier(nn.Module):
             nn.init.zeros_(self.score_proj.bias)
 
         self.ft = ft
-        self.n_unfrozen = configure_trainable(
-            self.backbone, ft, unfreeze_blocks, self.stem_name)
+        configure_trainable(self.backbone, ft, unfreeze_blocks, self.stem_name)
 
     def train(self, mode: bool = True):
         """En `linear`, el backbone queda en eval aunque el resto entrene.
