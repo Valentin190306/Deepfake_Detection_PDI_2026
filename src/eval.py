@@ -1,18 +1,24 @@
-"""Evalúa un checkpoint del ViT: métricas, matriz de confusión, curvas y galería.
+"""Evalúa un checkpoint: métricas, matriz de confusión, curvas y galería.
 
-Sirve tanto para la validación de IMD2020 como para un test externo: si el
+Sirve tanto para la validación mezclada como para un test externo: si el
 manifest es de otro dataset, usá --split all (no hay split guardado para él).
 
-    python src/eval.py --manifest data/manifest.csv --packed packed/raw__s384 \
-        --ckpt runs/vit/best.pt --out runs/eval --split val
+    python src/eval.py --manifest data/manifest_all.csv \
+        --ckpt runs/swin_partial/best.pt --out runs/eval --split val --by-dataset
+
+    # medir sólo un dataset del manifest mezclado (out-of-domain si se entrenó
+    # con los dos, o cross-dataset si se entrenó sólo con el otro)
+    python src/eval.py --manifest data/manifest_all.csv \
+        --ckpt runs/swin_partial/best.pt --out runs/eval_coco --split all --dataset coco
 
     # test externo (otro manifest + su propio cache empaquetado)
     python src/eval.py --manifest data_own/manifest.csv --packed packed/own \
-        --ckpt runs/vit/best.pt --out runs/eval_own --split all
+        --ckpt runs/swin_partial/best.pt --out runs/eval_own --split all
 """
 import argparse
 import csv
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -20,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from dataset import MapDataset, apply_splits, dedupe_rows, load_packed, read_manifest
+from dataset import MapDataset, apply_splits, dedupe_rows, read_manifest
 from model import build_model
 from train import metrics
 
@@ -89,7 +95,7 @@ def gallery(ds, y, p, thr, out: Path, n: int):
 
     fig, axes = plt.subplots(len(pick), 4, figsize=(13, 3.1 * len(pick)), squeeze=False)
     for r, i in enumerate(pick):
-        arr = np.array(ds.arr[ds.idx[i]])           # (5, S, S) uint8
+        arr = ds.raw(i)                              # (5, S, S) uint8
         rgb = arr[:3].transpose(1, 2, 0).astype(np.float32) / 255.0
         heat = arr[3].astype(np.float32) / 255.0
         conf = arr[4].astype(np.float32) / 255.0
@@ -160,14 +166,39 @@ def bootstrap_ci(rows: list[dict], y: np.ndarray, p: np.ndarray, thr: float,
             "n_groups": len(keys), "n_boot": len(aucs)}
 
 
+def by_dataset(rows: list[dict], y: np.ndarray, p: np.ndarray, thr: float) -> dict:
+    """Métricas separadas por dataset (cuando el manifest mezcla varios).
+
+    Es la lectura que importa al mezclar IMD2020 con COCOInpaint: IMD2020 es el
+    set de entrenamiento de TruFor (métrica inflada) y COCO es out-of-domain.
+    """
+    out = {}
+    for d in sorted({r.get("dataset", "") for r in rows}):
+        idx = np.array([i for i, r in enumerate(rows) if r.get("dataset", "") == d])
+        if not len(idx):
+            continue
+        m = metrics(y[idx], p[idx], thr)
+        m.update(operating_points(y[idx], p[idx], thr))
+        m.update({"n": int(len(idx)), "pos": int(y[idx].sum())})
+        out[d or "?"] = m
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default="data/manifest.csv")
-    ap.add_argument("--packed", default="packed/raw__s384")
+    ap.add_argument("--packed", default="",
+                    help="base del .npy empaquetado; si el manifest trae la columna "
+                         "`packed`, se usa la de cada fila")
     ap.add_argument("--ckpt", default="runs/vit/best.pt")
     ap.add_argument("--out", default="runs/eval")
     ap.add_argument("--splits", default="runs/splits.json")
     ap.add_argument("--split", default="val", choices=["val", "train", "all"])
+    ap.add_argument("--dataset", default="all",
+                    help="'all' o nombres separados por coma (imd,coco) para evaluar "
+                         "sólo esas filas; con --split all sirve de test cross-dataset")
+    ap.add_argument("--by-dataset", action="store_true",
+                    help="imprimir métricas separadas por dataset")
     ap.add_argument("--bs", type=int, default=32)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--threshold", type=float, default=None, help="por defecto, el guardado en el checkpoint")
@@ -182,6 +213,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows = read_manifest(Path(a.manifest))
+    if a.dataset != "all":
+        want = {d.strip() for d in a.dataset.split(",") if d.strip()}
+        known = {r.get("dataset", "") for r in rows}
+        if not (want & known):
+            sys.exit(f"--dataset {a.dataset} no coincide con ningún valor de la columna "
+                     f"`dataset` del manifest (hay: {sorted(known)}).")
+        rows = [r for r in rows if r.get("dataset", "") in want]
     if a.split == "all":
         sel = rows
     else:
@@ -197,7 +235,10 @@ def main():
         print(f"{a.split}: {n_sel} filas -> {len(sel)} únicas (manifest pareado)")
 
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
-    cfg = ck["cfg"]
+    cfg = dict(ck["cfg"])
+    # los pesos salen del checkpoint: bajar los de ImageNet sería una descarga
+    # de ~100 MB que se sobrescribe en la línea siguiente
+    cfg["pretrained"] = False
     model = build_model(**cfg).to(device)
     model.load_state_dict(ck["model"])
 
@@ -215,13 +256,19 @@ def main():
             thr = float(ck.get("thr", 0.5))
     m = metrics(y, p, thr)
     op = operating_points(y, p, thr)
-    m.update({"thr": thr, "n": int(len(y)), "pos": int(y.sum()),
-              "split": a.split, "ckpt": str(a.ckpt), "packed": str(a.packed), **op})
+    m.update({"thr": thr, "n": int(len(y)), "pos": int(y.sum()), "split": a.split,
+              "ckpt": str(a.ckpt), "packed": sorted(str(b) for b in ds.metas), **op})
 
     if a.bootstrap:
         ci = bootstrap_ci(ds.rows, y, p, thr, a.bootstrap, a.seed)
         if ci:
             m["ci"] = ci
+
+    per_ds = None
+    multi = len({r.get("dataset", "") for r in ds.rows}) > 1
+    if a.by_dataset or (a.dataset == "all" and multi):
+        per_ds = by_dataset(ds.rows, y, p, thr)
+        m["by_dataset"] = per_ds
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -229,10 +276,10 @@ def main():
 
     with open(out / "predictions.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file", "label", "prob", "pred", "error"])
+        w.writerow(["file", "label", "prob", "pred", "error", "dataset"])
         for r, pi in zip(ds.rows, p):
             w.writerow([r["file"], r["label"], f"{pi:.4f}", int(pi >= thr),
-                        int((pi >= thr) != r["label"])])
+                        int((pi >= thr) != r["label"]), r.get("dataset", "")])
 
     print(f"{a.split}: n={m['n']} pos={m['pos']} | thr {thr:.2f}")
     print(f"acc {m['acc']:.3f} | bal_acc {m['bal_acc']:.3f} | F1 {m['f1']:.3f} | "
@@ -242,6 +289,13 @@ def main():
     if "tpr@fpr1" in op:
         print(f"TPR a FPR fijo: 1% {op['tpr@fpr1']:.3f} | 5% {op['tpr@fpr5']:.3f} | "
               f"10% {op['tpr@fpr10']:.3f}")
+    if per_ds:
+        print("por dataset:")
+        for d, dm in per_ds.items():
+            print(f"  {d:8s} n={dm['n']:4d} pos={dm['pos']:4d} | "
+                  f"bal_acc {dm['bal_acc']:.3f} | AUC {dm['auc']:.3f} | "
+                  f"AP {dm['ap']:.3f} | recall {dm['recall']:.3f} "
+                  f"espec {dm['spec']:.3f}")
     if "ci" in m:
         ci = m["ci"]
         print(f"IC 95% (bootstrap por escena, {ci['n_groups']} escenas): "

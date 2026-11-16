@@ -17,6 +17,7 @@ import math
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +25,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import (MapDataset, apply_splits, dedupe_rows, load_packed, make_splits,
+from dataset import (MapDataset, apply_splits, dedupe_rows, make_splits,
                      pos_weight, read_manifest)
+from backbone import BACKBONES, layer_scale, stage_units
 from model import build_model, n_params
 
 
@@ -111,33 +113,75 @@ def save_atomic(obj, path: Path):
     tmp.replace(path)
 
 
-def param_groups(model, wd: float):
-    """Weight decay solo en matrices; nada en normas, biases, tokens ni alpha."""
-    decay, no_decay = [], []
+def param_groups(model, wd: float, lr: float, lr_backbone: float,
+                 layer_decay: float) -> list[dict]:
+    """Tres velocidades de aprendizaje, agrupadas por (rol, lr, weight decay).
+
+    - cabeza (y norma final): `lr`
+    - stem inflado: `lr` (sus canales nuevos arrancan en cero y necesitan moverse)
+    - backbone: `lr_backbone * layer_decay**(n - etapa)`, así las primeras capas
+      se mueven menos y no se destruyen los features genéricos.
+
+    Weight decay sólo en matrices; nada en normas, biases, tokens ni alpha.
+    """
+    backbone = getattr(model, "backbone", None)
+    n_units = len(stage_units(backbone)[1]) if backbone is not None else 0
+    stem = getattr(model, "stem_name", None)
+    groups: dict[tuple, list] = {}
+
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        (no_decay if p.ndim < 2 or name.endswith("alpha") or "cls_token" in name
-         or "pos_embed" in name else decay).append(p)
-    return [{"params": decay, "weight_decay": wd},
-            {"params": no_decay, "weight_decay": 0.0}]
+        decay = not (p.ndim < 2 or name.endswith("alpha") or "cls_token" in name
+                     or "pos_embed" in name or "relative_position_bias_table" in name)
+        if backbone is not None and name.startswith("backbone."):
+            if stem and name.startswith(f"backbone.{stem}."):
+                kind, rate = "stem", lr
+            else:
+                scale = layer_scale(name, n_units, layer_decay)
+                kind, rate = ("backbone", lr_backbone * scale) if scale is not None else ("head", lr)
+        else:
+            kind, rate = "head", lr
+        groups.setdefault((kind, round(rate, 12), decay), []).append(p)
+
+    out = []
+    for (kind, rate, decay), ps in groups.items():
+        out.append({"params": ps, "lr": rate, "weight_decay": wd if decay else 0.0,
+                    "name": kind})
+    return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Entrena el ViT clasificador (TruFor maps)")
+    ap = argparse.ArgumentParser(description="Entrena el clasificador (mapas de TruFor)")
     ap.add_argument("--manifest", default="data/manifest.csv")
-    ap.add_argument("--packed", default="packed/raw__s384", help="base del .npy empaquetado")
+    ap.add_argument("--packed", default="",
+                    help="base del .npy empaquetado; si el manifest trae la columna "
+                         "`packed`, se usa la de cada fila y esto se ignora")
     ap.add_argument("--splits", default="runs/splits.json")
     ap.add_argument("--out", default="runs/vit")
     ap.add_argument("--channels", default="maps+rgb", choices=["maps+rgb", "maps"])
-    # arquitectura (tiene que coincidir con el tamaño empaquetado)
+    # arquitectura: backbone preentrenado (default) o el ViT desde cero (control)
+    ap.add_argument("--backbone", default="swin_t", choices=["scratch", *BACKBONES],
+                    help="backbone preentrenado de timm; 'scratch' es el ViT chico "
+                         "desde cero que se usó en la primera versión")
+    ap.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True,
+                    help="cargar los pesos de ImageNet (--no-pretrained para ablación)")
+    ap.add_argument("--ft", default="full", choices=["linear", "partial", "full"],
+                    help="linear: backbone congelado (transfer learning); partial: "
+                         "últimas etapas/bloques; full: todo con lr más bajo")
+    ap.add_argument("--unfreeze-blocks", type=int, default=0,
+                    help="cuántas etapas/bloques descongelar con --ft partial "
+                         "(0 = automático: 1 etapa, o 4 bloques en un ViT)")
     ap.add_argument("--size", type=int, default=384)
+    # arquitectura del ViT desde cero (sólo con --backbone scratch)
     ap.add_argument("--patch", type=int, default=16)
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--heads", type=int, default=6)
-    ap.add_argument("--drop", type=float, default=0.15)
     ap.add_argument("--attn-drop", type=float, default=0.0)
+    ap.add_argument("--drop", type=float, default=0.0,
+                    help="dropout; con backbone preentrenado 0-0.1 alcanza "
+                         "(para --backbone scratch, 0.15 es lo probado)")
     ap.add_argument("--drop-path", type=float, default=0.1)
     ap.add_argument("--no-score", action="store_true",
                     help="no pasar el score global como token (el prior residual sigue activo)")
@@ -145,7 +189,14 @@ def main():
     # optimización
     ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--bs", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=3e-4,
+                    help="lr de la cabeza y del stem; con --ft linear conviene subirlo "
+                         "(1e-3) porque sólo se entrena la cabeza")
+    ap.add_argument("--lr-backbone", type=float, default=0.0,
+                    help="lr del backbone preentrenado (0 = lr/10)")
+    ap.add_argument("--layer-decay", type=float, default=0.75,
+                    help="decaimiento del lr por profundidad del backbone en --ft full "
+                         "(0 lo apaga)")
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--min-lr", type=float, default=0.01, help="fracción del lr al final del coseno")
@@ -180,6 +231,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda" and not a.no_amp
 
+    # Si se reanuda, los pesos vienen de last.pt: bajar los de ImageNet sería
+    # una descarga de ~100 MB que se sobrescribe enseguida.
+    out = Path(a.out)
+    last = out / "last.pt"
+    resume = last.exists() and not a.fresh
+
     # ---- datos ------------------------------------------------------------
     rows = read_manifest(Path(a.manifest))
     splits_path = Path(a.splits)
@@ -200,10 +257,6 @@ def main():
         print(f"val: {n_val} filas -> {len(val_rows)} únicas "
               f"(el manifest repite auténticas por escena)")
 
-    _, meta, index = load_packed(a.packed)
-    if int(meta["size"]) != a.size:
-        sys.exit(f"El cache está empaquetado a {meta['size']}px pero --size es {a.size}. "
-                 f"Usá --size {meta['size']} o regenerá el cache.")
     in_chans = 5 if a.channels == "maps+rgb" else 2
 
     ds_kw = dict(packed=a.packed, channels=a.channels)
@@ -214,25 +267,59 @@ def main():
         pin_memory=device.type == "cuda", drop_last=shuffle and len(ds) > a.bs,
         persistent_workers=a.workers > 0)
     train_dl, val_dl = dl(train_ds, True), dl(val_ds, False)
-    print(f"train={len(train_ds)} val={len(val_ds)} | {meta.get('variant', '?')} "
-          f"| {meta['size']}px | canales={a.channels} | device={device} amp={amp}")
+
+    # el tamaño tiene que coincidir con TODOS los caches usados (puede haber más
+    # de uno si el manifest mezcla datasets)
+    bad = {b: s for b, s in val_ds.sizes.items() if s != a.size}
+    if bad:
+        detail = ", ".join(f"{Path(b).name}={s}px" for b, s in bad.items())
+        sys.exit(f"El cache está empaquetado a {detail} pero --size es {a.size}. "
+                 f"Usá el tamaño del cache o regeneralo.")
+    print(f"train={len(train_ds)} val={len(val_ds)} | {train_ds.summary()} "
+          f"| canales={a.channels} | device={device} amp={amp}")
+    if "dataset" in (train_rows[0] if train_rows else {}):
+        by = {}
+        for r in train_ds.rows:
+            d = r.get("dataset", "?")
+            by.setdefault(d, [0, 0])
+            by[d][0] += 1
+            by[d][1] += r["label"]
+        print("train por dataset: " + " | ".join(
+            f"{d}: {n} filas ({p} pos)" for d, (n, p) in sorted(by.items())))
 
     # baseline: qué AUC tiene el score de TruFor sobre esta misma validación
     val_y = np.array([r["label"] for r in val_ds.rows])
-    val_s = np.array([meta["scores"][index[Path(r["file"]).stem]] for r in val_ds.rows])
-    base = metrics(val_y, val_s)
+    base = metrics(val_y, val_ds.scores)
     print(f"baseline TruFor (val): AUC {base['auc']:.3f} | AP {base['ap']:.3f} | "
           f"F1@0.5 {base['f1']:.3f}")
 
     # ---- modelo -----------------------------------------------------------
-    cfg = dict(in_chans=in_chans, img_size=a.size, patch=a.patch, dim=a.dim, depth=a.depth,
-               heads=a.heads, drop=a.drop, attn_drop=a.attn_drop, drop_path=a.drop_path,
-               use_score=not a.no_score, residual=not a.no_residual)
+    if a.backbone == "scratch":
+        cfg = dict(arch="scratch", in_chans=in_chans, img_size=a.size, patch=a.patch,
+                   dim=a.dim, depth=a.depth, heads=a.heads, drop=a.drop,
+                   attn_drop=a.attn_drop, drop_path=a.drop_path,
+                   use_score=not a.no_score, residual=not a.no_residual)
+    else:
+        cfg = dict(arch="backbone", backbone=a.backbone, in_chans=in_chans,
+                   img_size=a.size, pretrained=a.pretrained and not resume,
+                   drop=a.drop, drop_path=a.drop_path, use_score=not a.no_score,
+                   residual=not a.no_residual, ft=a.ft,
+                   unfreeze_blocks=a.unfreeze_blocks)
     model = build_model(**cfg).to(device)
-    print(f"ViT desde cero: {n_params(model):.1f}M parámetros "
-          f"({a.depth} bloques, dim {a.dim}, patch {a.patch})")
+    if hasattr(model, "describe"):
+        print(f"modelo: {model.describe()}")
+    else:
+        print(f"modelo: ViT desde cero | {n_params(model):.1f}M parámetros "
+              f"({a.depth} bloques, dim {a.dim}, patch {a.patch})")
 
-    opt = torch.optim.AdamW(param_groups(model, a.wd), lr=a.lr, betas=(0.9, 0.999))
+    lr_backbone = a.lr_backbone if a.lr_backbone > 0 else a.lr / 10
+    groups = param_groups(model, a.wd, a.lr, lr_backbone, a.layer_decay)
+    opt = torch.optim.AdamW(groups, lr=a.lr, betas=(0.9, 0.999))
+    rates = sorted({g["lr"] for g in groups})
+    roles = dict(Counter(g["name"] for g in groups))
+    extra = ("" if a.backbone == "scratch"
+             else f" | backbone {lr_backbone:.1e}, layer-decay {a.layer_decay}")
+    print(f"lr: {len(groups)} grupos {roles}, de {rates[0]:.1e} a {rates[-1]:.1e}{extra}")
 
     def lr_lambda(ep):
         if ep < a.warmup:
@@ -264,12 +351,16 @@ def main():
         log_path.write_text("epoch,lr,train_loss,val_loss,acc,bal_acc,f1,auc,ap,thr,f1_best,secs\n")
 
     start, best, bad = 0, -1.0, 0
-    last = out / "last.pt"
-    if last.exists() and not a.fresh:
+    if resume:
         ck = torch.load(last, map_location=device, weights_only=False)
         old = ck.get("args", {})
-        changed = [k for k in ("aux_weight", "no_score", "no_residual", "channels", "size")
-                   if k in old and old.get(k) != vars(a).get(k)]
+        # `old.get(k, "<no registrado>")`: un checkpoint viejo no guardó los flags
+        # nuevos, y reanudarlo con otro `aux_weight`/`ft` cambia el entrenamiento
+        # a mitad de camino sin que se note. Mejor avisar de más.
+        watched = ("backbone", "ft", "pretrained", "aux_weight", "no_score",
+                   "no_residual", "channels", "size")
+        changed = [k for k in watched
+                   if old.get(k, "<no registrado>") != vars(a).get(k)]
         if changed:
             print(f"AVISO: reanudás con flags distintos a la corrida guardada: {changed}. "
                   "Si querés comparar de cero, usá --fresh o un --out nuevo.")

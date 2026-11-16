@@ -1,21 +1,26 @@
-"""ViT propio (entrenado desde cero) para clasificación binaria de imágenes.
+"""Clasificador binario (manipulada vs auténtica) sobre los mapas de TruFor.
 
-Entrada : (B, C, S, S) con C = 5 (RGB normalizado + mapa + confianza de TruFor)
-          y (B,) con el score global de TruFor.
-Salida  : un logit por imagen (manipulada vs auténtica).
+Dos arquitecturas, elegidas por `build_model` según `cfg["arch"]`:
 
-Dos decisiones pensadas para el régimen "desde cero con ~2400 imágenes":
-  - el score global de TruFor entra como un token extra (prior), así el ViT
-    puede apoyarse en el detector ya entrenado;
-  - con `residual`, el logit final es `vit_logit + alpha * logit(score)`, con
-    alpha=1 inicial. En la época 0 el modelo equivale a TruFor y solo aprende
-    una corrección: no puede arrancar peor que el baseline.
+  scratch   `TruForViTClassifier`: ViT chico entrenado desde cero. Es la versión
+            original y quedó como control: con ~1000 imágenes colapsó a calibrar
+            el score de TruFor (alpha≈1, spearman −0.96).
+  backbone  `TruForBackboneClassifier`: backbone preentrenado de timm (Swin-T,
+            ViT-S/16, ...) con el stem inflado a 5 canales. Es el default nuevo.
+
+En las dos, la interfaz es la misma: `forward(x, score, return_parts=True)`
+devuelve `(logit_final, vit_logit)`, donde `vit_logit` es la rama propia sin el
+prior de TruFor (sirve para la loss auxiliar). El logit final es
+`vit_logit + alpha·logit(score)`, así que en la época 0 el modelo no puede
+arrancar peor que TruFor.
 """
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from backbone import configure_trainable, create_backbone, describe
 
 
 class DropPath(nn.Module):
@@ -143,11 +148,96 @@ class TruForViTClassifier(nn.Module):
         return logit
 
 
-def build_model(**cfg) -> TruForViTClassifier:
-    """Construye el modelo desde un dict de hiperparámetros (config.json)."""
-    keys = ("in_chans", "img_size", "patch", "dim", "depth", "heads", "mlp_ratio",
-            "drop", "attn_drop", "drop_path", "use_score", "residual")
-    return TruForViTClassifier(**{k: cfg[k] for k in keys if k in cfg})
+class TruForBackboneClassifier(nn.Module):
+    """Backbone preentrenado (timm) + cabeza lineal + prior residual de TruFor.
+
+    El backbone devuelve un vector de features ya pooled (768 en Swin-T, 384 en
+    ViT-S). Sobre eso: dropout, una capa lineal a un logit y, si `use_score`, el
+    score de TruFor se suma al vector de features antes de la cabeza (el
+    equivalente del token de clase de la versión desde cero).
+
+    `ft` controla cuánto se mueve el backbone (ver backbone.py). El stem queda
+    siempre entrenable para que los mapas puedan entrar.
+    """
+
+    def __init__(self, backbone="swin_t", in_chans=5, img_size=384, pretrained=True,
+                 drop=0.0, drop_path=0.1, use_score=True, residual=True,
+                 ft="full", unfreeze_blocks=0):
+        super().__init__()
+        self.backbone_name = backbone
+        self.backbone, self.stem_name = create_backbone(
+            backbone, in_chans=in_chans, img_size=img_size, pretrained=pretrained,
+            drop=drop, drop_path=drop_path)
+        dim = self.backbone.num_features
+
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(dim, 1)
+        self.use_score = use_score
+        self.score_proj = nn.Linear(2, dim) if use_score else None
+        self.residual = residual
+        self.alpha = nn.Parameter(torch.ones(1)) if residual else None
+
+        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+        if self.score_proj is not None:
+            nn.init.trunc_normal_(self.score_proj.weight, std=0.02)
+            nn.init.zeros_(self.score_proj.bias)
+
+        self.ft = ft
+        self.n_unfrozen = configure_trainable(
+            self.backbone, ft, unfreeze_blocks, self.stem_name)
+
+    def train(self, mode: bool = True):
+        """En `linear`, el backbone queda en eval aunque el resto entrene.
+
+        Con el backbone congelado, `train()` sólo serviría para activar su
+        dropout y su stochastic depth: features que cambian al azar en cada
+        época, y una cabeza que aprende sobre ruido. En eval son deterministas,
+        que es lo que se quiere medir en un transfer learning.
+        """
+        super().train(mode)
+        if self.ft == "linear":
+            self.backbone.eval()
+        return self
+
+    def forward(self, x, score=None, return_parts=False):
+        feats = self.backbone(x)
+
+        prior = None
+        if score is not None:
+            prior = _logit(score)
+            if self.use_score:
+                # se suma al vector de features: el prior entra antes de la cabeza
+                feats = feats + self.score_proj(torch.stack([score, prior], -1))
+
+        vit_logit = self.head(self.drop(feats)).squeeze(-1)
+        logit = vit_logit
+        if self.residual and prior is not None:
+            logit = logit + self.alpha * prior
+        if return_parts:
+            return logit, vit_logit
+        return logit
+
+    def describe(self) -> str:
+        return f"{self.backbone_name} | ft={self.ft} | {describe(self.backbone, self.stem_name)}"
+
+
+def build_model(**cfg) -> nn.Module:
+    """Construye el modelo desde un dict de hiperparámetros (config.json).
+
+    Los checkpoints viejos no tienen `arch`: se interpretan como `scratch`, así
+    que siguen cargando sin migración.
+    """
+    arch = cfg.get("arch", "scratch")
+    if arch == "scratch":
+        keys = ("in_chans", "img_size", "patch", "dim", "depth", "heads", "mlp_ratio",
+                "drop", "attn_drop", "drop_path", "use_score", "residual")
+        return TruForViTClassifier(**{k: cfg[k] for k in keys if k in cfg})
+    if arch != "backbone":
+        raise SystemExit(f"arch desconocida: {arch} (scratch, backbone)")
+    keys = ("backbone", "in_chans", "img_size", "pretrained", "drop", "drop_path",
+            "use_score", "residual", "ft", "unfreeze_blocks")
+    return TruForBackboneClassifier(**{k: cfg[k] for k in keys if k in cfg})
 
 
 def n_params(model) -> float:
